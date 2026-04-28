@@ -41,9 +41,15 @@ pub enum PageAlignment {
 }
 
 /// Bundle of layout knobs threaded through B+tree construction.
+///
+/// Combine via [`BuildPolicy::compact`] (in-memory friendly) or
+/// [`BuildPolicy::disk_aligned`] (file-backed), or build directly from
+/// [`NodeSizing`] and [`PageAlignment`] for fine control.
 #[derive(Clone, Debug)]
 pub struct BuildPolicy {
+    /// How node fanout is decided when flushing.
     pub sizing: NodeSizing,
+    /// Whether to pad container layout for page-cache friendliness.
     pub align: PageAlignment,
 }
 
@@ -104,6 +110,11 @@ impl Default for BuildPolicy {
     }
 }
 
+/// Top-level writer configuration.
+///
+/// Combine with [`Writer::with_options`] to override the defaults.
+/// `WriterOptions::default()` gives an in-memory–friendly setup
+/// (fixed fanout, no padding, tightest output).
 #[derive(Clone, Debug)]
 pub struct WriterOptions {
     /// Max entries buffered (and sorted) per object run before flushing.
@@ -245,6 +256,17 @@ enum Frame {
     Object(ObjectState),
 }
 
+/// Streaming writer for a single Kahon document.
+///
+/// A `Writer` wraps any [`Sink`] (every [`std::io::Write`] qualifies) and
+/// lets you push exactly one root value — a scalar, an array, or an
+/// object — before [`finish`](Writer::finish) emits the trailer.
+///
+/// Values are written as they arrive; container nodes are buffered only
+/// until they fill (per [`BuildPolicy`]) and then flushed. Peak memory
+/// is bounded by tree depth, not document size.
+///
+/// See the [crate-level docs](crate) for a full example.
 pub struct Writer<S: Sink> {
     sink: S,
     pos: u64,
@@ -258,12 +280,20 @@ pub struct Writer<S: Sink> {
 }
 
 impl<S: Sink> Writer<S> {
+    /// Create a writer with default options ([`WriterOptions::default`]).
+    ///
+    /// The header is written eagerly; if that initial write fails, the
+    /// writer is poisoned and the error surfaces on the next operation.
     pub fn new(sink: S) -> Self {
         // Default policy is statically known-valid; unwrap is safe.
         Self::with_options(sink, WriterOptions::default())
             .expect("default WriterOptions must validate")
     }
 
+    /// Create a writer with caller-supplied [`WriterOptions`].
+    ///
+    /// Returns [`WriteError::InvalidOption`] if the policy is malformed
+    /// (fanout < 2, target bytes < 64, or non–power-of-two page size).
     pub fn with_options(sink: S, opts: WriterOptions) -> Result<Self, WriteError> {
         opts.policy.validate()?;
         let mut w = Self {
@@ -285,6 +315,8 @@ impl<S: Sink> Writer<S> {
         Ok(w)
     }
 
+    /// Total bytes emitted to the sink so far, including the header,
+    /// every flushed value/node, and any alignment padding.
     pub fn bytes_written(&self) -> u64 {
         self.pos
     }
@@ -320,7 +352,12 @@ impl<S: Sink> Writer<S> {
         total
     }
 
-    /// Write the trailer and return the sink.
+    /// Finalize the document by writing the 12-byte trailer and return
+    /// the underlying sink.
+    ///
+    /// Errors if the writer is poisoned, has already been finished, has
+    /// open container builders, or never received a root value
+    /// ([`WriteError::EmptyDocument`]).
     pub fn finish(mut self) -> Result<S, WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
@@ -364,6 +401,8 @@ impl<S: Sink> Writer<S> {
         Ok(self.sink)
     }
 
+    /// Push a `null` as the document root, or as the next array
+    /// element / object value.
     pub fn push_null(&mut self) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| {
@@ -373,6 +412,7 @@ impl<S: Sink> Writer<S> {
         self.register_value(off)
     }
 
+    /// Push a boolean.
     pub fn push_bool(&mut self, v: bool) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| {
@@ -386,24 +426,35 @@ impl<S: Sink> Writer<S> {
         self.register_value(off)
     }
 
+    /// Push a signed 64-bit integer. Encoded in the narrowest tag that
+    /// fits the value.
     pub fn push_i64(&mut self, v: i64) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| write_integer(b, v as i128))?;
         self.register_value(off)
     }
 
+    /// Push an unsigned 64-bit integer. Values up to `2^64 - 1` are
+    /// representable; encoded in the narrowest tag that fits.
     pub fn push_u64(&mut self, v: u64) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| write_integer(b, v as i128))?;
         self.register_value(off)
     }
 
+    /// Push a 64-bit float.
+    ///
+    /// Returns [`WriteError::NaNOrInfinity`] for NaN or ±∞, and
+    /// [`WriteError::FloatPrecisionLoss`] if the value cannot be
+    /// represented losslessly in the chosen narrower encoding.
     pub fn push_f64(&mut self, v: f64) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| write_f64(b, v))?;
         self.register_value(off)
     }
 
+    /// Push a UTF-8 string. The bytes are written as-is; no escaping is
+    /// applied.
     pub fn push_str(&mut self, s: &str) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| {
@@ -413,11 +464,17 @@ impl<S: Sink> Writer<S> {
         self.register_value(off)
     }
 
+    /// Open an array. The returned [`ArrayBuilder`](crate::ArrayBuilder) borrows the writer
+    /// mutably; close it via `.end()` (errors propagated) or by drop
+    /// (errors poison the writer).
     pub fn start_array(&mut self) -> crate::builder::ArrayBuilder<'_, S> {
         self.push_array_frame();
         crate::builder::ArrayBuilder::new(self)
     }
 
+    /// Open an object. The returned [`ObjectBuilder`](crate::ObjectBuilder) borrows the writer
+    /// mutably; close it via `.end()` (errors propagated) or by drop
+    /// (errors poison the writer).
     pub fn start_object(&mut self) -> crate::builder::ObjectBuilder<'_, S> {
         self.push_object_frame();
         crate::builder::ObjectBuilder::new(self)

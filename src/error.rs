@@ -1,19 +1,42 @@
 use std::fmt;
 use std::io;
 
+/// Errors returned by the writer.
+///
+/// Most variants describe API misuse (out-of-order pushes, duplicate
+/// keys) or value-shape problems (NaN floats, out-of-range integers).
+/// I/O failures from the underlying sink are wrapped in
+/// [`WriteError::Io`].
+///
+/// Once any operation returns an error, the writer becomes *poisoned*
+/// and subsequent calls fail with [`WriteError::Poisoned`] instead of
+/// producing a malformed document.
 #[derive(Debug)]
 pub enum WriteError {
+    /// The underlying [`Sink`](crate::Sink) returned an `io::Error`.
     Io(io::Error),
+    /// Integer fell outside the representable range `[-2^63, 2^64 - 1]`.
     IntegerOutOfRange,
+    /// `f64` was NaN or ±∞, neither of which is representable.
     NaNOrInfinity,
+    /// A float could not be encoded losslessly in the chosen tag.
     FloatPrecisionLoss,
+    /// Two equal keys appeared within the same object flush window.
     DuplicateKey,
+    /// [`Writer::finish`](crate::Writer::finish) was called before any
+    /// root value was pushed.
     EmptyDocument,
+    /// More than one root value was pushed at the writer level.
     MultipleRootValues,
+    /// A value was pushed into an object without a preceding key.
     MisuseObjectValue,
+    /// A key was pushed while a previous key still awaited its value.
     MisuseObjectKey,
+    /// A previous error left the writer in an unrecoverable state.
     Poisoned,
+    /// [`Writer::finish`](crate::Writer::finish) was called twice.
     AlreadyFinished,
+    /// [`WriterOptions`](crate::WriterOptions) failed validation.
     InvalidOption(&'static str),
 }
 
