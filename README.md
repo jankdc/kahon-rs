@@ -1,4 +1,4 @@
-# kahon
+# Kahon for Rust
 
 A Rust writer for the [Kahon binary format](https://github.com/jankdc/kahon).
 
