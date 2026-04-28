@@ -1,0 +1,19 @@
+[package]
+name = "kahon"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[example]]
+name = "monster"
+path = "examples/monster.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+proptest = "1"
