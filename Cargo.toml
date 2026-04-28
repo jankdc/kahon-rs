@@ -10,6 +10,7 @@ documentation = "https://docs.rs/kahon"
 readme = "README.md"
 keywords = ["kahon", "json", "serialization", "streaming"]
 categories = ["encoding", "data-structures"]
+exclude = ["tests/", "examples/bench.rs", ".github/", ".gitignore"]
 
 [lib]
 path = "src/lib.rs"
