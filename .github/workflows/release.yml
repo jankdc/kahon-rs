@@ -12,6 +12,7 @@ jobs:
     name: Release-plz release
     if: ${{ github.repository_owner == 'jankdc' }}
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       id-token: write
       contents: write
