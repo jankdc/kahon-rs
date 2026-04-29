@@ -1,11 +1,5 @@
 //! Error-path tests for `WriteError` variants reachable through the public API.
 //!
-//! Some variants (`MisuseObjectKey`, `MisuseObjectValue`, `AlreadyFinished`,
-//! `IntegerOutOfRange`) are not reachable today: the builder borrow-checker
-//! prevents misuse, `finish()` consumes the writer, and `push_i64`/`push_u64`
-//! cover exactly the spec range. Those would only fire if a future API
-//! exposed `i128` or raw-frame manipulation.
-//!
 //! Each test follows the same shape: drive the writer to the failure point,
 //! capture the result, assert the variant.
 

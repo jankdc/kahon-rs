@@ -38,11 +38,11 @@ pub(crate) fn write_uintw(buf: &mut Vec<u8>, v: u64, width: usize) {
 }
 
 /// Write an integer choosing the smallest tag.
+///
+/// `v` must lie in `[i64::MIN, u64::MAX]`. The public API enforces this
+/// by construction (`push_i64`/`push_u64` widen from `i64`/`u64`).
 pub(crate) fn write_integer(buf: &mut Vec<u8>, v: i128) -> Result<(), WriteError> {
-    // Range rule: the whole-JSON-number range is [-2^63, 2^64 - 1].
-    if v < i128::from(i64::MIN) || v > i128::from(u64::MAX) {
-        return Err(WriteError::IntegerOutOfRange);
-    }
+    debug_assert!(v >= i128::from(i64::MIN) && v <= i128::from(u64::MAX));
 
     if (0..=31).contains(&v) {
         buf.push(TINY_UINT + v as u8);

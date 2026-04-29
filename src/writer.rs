@@ -156,12 +156,12 @@ struct ObjectState {
 }
 
 impl ObjectState {
-    fn set_pending_key(&mut self, key_bytes: Vec<u8>, key_off: u64) -> Result<(), WriteError> {
-        if self.pending_key.is_some() {
-            return Err(WriteError::MisuseObjectKey);
-        }
+    fn set_pending_key(&mut self, key_bytes: Vec<u8>, key_off: u64) {
+        debug_assert!(
+            self.pending_key.is_none(),
+            "ObjectBuilder consumes pending_key on every push; double-set is unreachable"
+        );
         self.pending_key = Some((key_bytes, key_off));
-        Ok(())
     }
 
     /// Pair a just-emitted value offset with the pending key; flush the run
@@ -173,10 +173,9 @@ impl ObjectState {
         policy: &BuildPolicy,
         ctx: &mut WriteCtx<'_, S>,
     ) -> Result<(), WriteError> {
-        let (kb, koff) = self
-            .pending_key
-            .take()
-            .ok_or(WriteError::MisuseObjectValue)?;
+        let (kb, koff) = self.pending_key.take().expect(
+            "ObjectBuilder always sets pending_key before producing a value; None is unreachable",
+        );
         self.current_run_key_bytes += kb.capacity();
         self.current_run.push((kb, koff, val_off));
         if self.current_run.len() >= run_buffer {
@@ -232,9 +231,10 @@ impl ObjectState {
         policy: &BuildPolicy,
         ctx: &mut WriteCtx<'_, S>,
     ) -> Result<u64, WriteError> {
-        if self.pending_key.is_some() {
-            return Err(WriteError::MisuseObjectValue);
-        }
+        debug_assert!(
+            self.pending_key.is_none(),
+            "ObjectBuilder consumes pending_key before close; Some is unreachable"
+        );
         if !self.current_run.is_empty() {
             self.flush_run(policy, ctx)?;
         }
@@ -278,7 +278,6 @@ pub struct Writer<S: Sink> {
     opts: WriterOptions,
     root_offset: Option<u64>,
     pub(crate) poisoned: bool,
-    finished: bool,
 }
 
 impl<S: Sink> Writer<S> {
@@ -307,7 +306,6 @@ impl<S: Sink> Writer<S> {
             opts,
             root_offset: None,
             poisoned: false,
-            finished: false,
         };
         // If the header write fails, defer the error: poison now and surface
         // it on the first push/finish.
@@ -357,15 +355,11 @@ impl<S: Sink> Writer<S> {
     /// Finalize the document by writing the 12-byte trailer and return
     /// the underlying sink.
     ///
-    /// Errors if the writer is poisoned, has already been finished, has
-    /// open container builders, or never received a root value
-    /// ([`WriteError::EmptyDocument`]).
+    /// Errors if the writer is poisoned, has open container builders,
+    /// or never received a root value ([`WriteError::EmptyDocument`]).
     pub fn finish(mut self) -> Result<S, WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
-        }
-        if self.finished {
-            return Err(WriteError::AlreadyFinished);
         }
         if !self.frames.is_empty() {
             self.poisoned = true;
@@ -399,7 +393,6 @@ impl<S: Sink> Writer<S> {
         trailer[8..].copy_from_slice(&MAGIC);
         self.sink.write_all(&trailer)?;
         self.pos += trailer.len() as u64;
-        self.finished = true;
         Ok(self.sink)
     }
 
@@ -446,9 +439,7 @@ impl<S: Sink> Writer<S> {
 
     /// Push a 64-bit float.
     ///
-    /// Returns [`WriteError::NaNOrInfinity`] for NaN or ±∞, and
-    /// [`WriteError::FloatPrecisionLoss`] if the value cannot be
-    /// represented losslessly in the chosen narrower encoding.
+    /// Returns [`WriteError::NaNOrInfinity`] for NaN or ±∞.
     pub fn push_f64(&mut self, v: f64) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| write_f64(b, v))?;
@@ -496,8 +487,14 @@ impl<S: Sink> Writer<S> {
             Ok(())
         })?;
         match self.frames.last_mut() {
-            Some(Frame::Object(o)) => o.set_pending_key(key.as_bytes().to_vec(), off),
-            _ => Err(WriteError::MisuseObjectKey),
+            Some(Frame::Object(o)) => {
+                o.set_pending_key(key.as_bytes().to_vec(), off);
+                Ok(())
+            }
+            _ => unreachable!(
+                "set_pending_key is pub(crate) and only called from ObjectBuilder \
+                 with an Object frame on top"
+            ),
         }
     }
 
@@ -545,9 +542,6 @@ impl<S: Sink> Writer<S> {
     fn check_ready(&self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
-        }
-        if self.finished {
-            return Err(WriteError::AlreadyFinished);
         }
         Ok(())
     }

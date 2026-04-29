@@ -102,7 +102,7 @@ fn write_number_root<S: kahon::Sink>(w: &mut Writer<S>, n: &Number) -> Result<()
             return w.push_u64(u);
         }
     }
-    let f = n.as_f64().ok_or(WriteError::IntegerOutOfRange)?;
+    let f = n.as_f64().expect("serde_json Number always converts to f64");
     w.push_f64(f)
 }
 
@@ -120,7 +120,7 @@ fn write_number_in_array<S: kahon::Sink>(
             return a.push_i64(i);
         }
     }
-    a.push_f64(n.as_f64().ok_or(WriteError::IntegerOutOfRange)?)
+    a.push_f64(n.as_f64().expect("serde_json Number always converts to f64"))
 }
 
 fn write_number_in_object<S: kahon::Sink>(
@@ -138,5 +138,5 @@ fn write_number_in_object<S: kahon::Sink>(
             return o.push_i64(key, i);
         }
     }
-    o.push_f64(key, n.as_f64().ok_or(WriteError::IntegerOutOfRange)?)
+    o.push_f64(key, n.as_f64().expect("serde_json Number always converts to f64"))
 }
