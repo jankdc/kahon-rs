@@ -53,8 +53,9 @@
 //!   which return an [`ArrayBuilder`] or [`ObjectBuilder`]. Builders
 //!   borrow their parent mutably and may be nested freely.
 //! - Object keys are passed positionally before the value
-//!   (`obj.push_i64("hp", 80)`). Duplicate keys within an object are
-//!   rejected.
+//!   (`obj.push_i64("hp", 80)`). Duplicate keys within an object's
+//!   sort window resolve last-wins (the latest push for a given key
+//!   replaces earlier ones).
 //!
 //! # Closing builders: `Drop` vs `end`
 //!

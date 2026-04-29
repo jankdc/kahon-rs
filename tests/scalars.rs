@@ -5,20 +5,29 @@ use kahon::{WriteError, Writer};
 
 #[test]
 fn integer_width_selection() {
-    // (value, expected tag byte). Covers SmallInt, UInt8/16/32, Int8/16.
+    // (value, expected tag byte). Boundaries pinned to upstream
+    // conformance vectors `scalar/{tinyuint,tinynegint,uint*,int*}-*`.
     let cases: &[(i128, u8)] = &[
         (0, 0x13),
         (31, 0x32),
         (-1, 0x03),
         (-16, 0x12),
-        (32, 0x40), // UInt8
+        (32, 0x40), // UInt8 low
         (255, 0x40),
-        (256, 0x41), // UInt16
+        (256, 0x41), // UInt16 low
         (65535, 0x41),
-        (65536, 0x42), // UInt32
-        (-17, 0x44),   // Int8
+        (65536, 0x42), // UInt32 low
+        (4_294_967_295, 0x42),
+        (4_294_967_296, 0x43), // UInt64 low — scalar/uint64-2pow32
+        (u64::MAX as i128, 0x43),
+        (-17, 0x44), // Int8 low
         (-128, 0x44),
-        (-129, 0x45), // Int16
+        (-129, 0x45), // Int16 low — scalar/int16-neg129
+        (-32768, 0x45),
+        (-32769, 0x46), // Int32 low — scalar/int32-neg32769
+        (-2_147_483_648, 0x46),
+        (-2_147_483_649, 0x47), // Int64 low — scalar/int64-neg2pow31m1
+        (i64::MIN as i128, 0x47),
     ];
     for &(v, tag) in cases {
         let buf = build(|w| {
@@ -47,6 +56,27 @@ fn integer_range_boundaries_accepted() {
         w.push_i64(v).unwrap();
         w.finish().unwrap();
     }
+}
+
+#[test]
+fn null_root_emits_single_tag_byte() {
+    // scalar/null
+    let buf = build(|w| w.push_null().unwrap());
+    assert_eq!(body(&buf), &[0x00]);
+}
+
+#[test]
+fn true_root_emits_single_tag_byte() {
+    // scalar/true
+    let buf = build(|w| w.push_bool(true).unwrap());
+    assert_eq!(body(&buf), &[0x02]);
+}
+
+#[test]
+fn false_root_emits_single_tag_byte() {
+    // scalar/false
+    let buf = build(|w| w.push_bool(false).unwrap());
+    assert_eq!(body(&buf), &[0x01]);
 }
 
 #[test]

@@ -90,9 +90,6 @@ impl<'a, S: Sink> ObjectBuilder<'a, S> {
     }
 
     /// Insert `null` at `key`.
-    ///
-    /// Keys must be unique within an object; a duplicate within the
-    /// same flush window returns [`WriteError::DuplicateKey`].
     pub fn push_null(&mut self, key: &str) -> Result<(), WriteError> {
         self.w.set_pending_key(key)?;
         self.w.push_null()
