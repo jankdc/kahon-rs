@@ -13,7 +13,6 @@ pub enum ReadError {
     Truncated,
     BadUtf8,
     BadFloat,
-    DuplicateKey(String),
     UnsortedKeys,
     InternalFanoutTooSmall,
     SubTotalMismatch,
@@ -119,6 +118,10 @@ fn lookup_in_object(
             let mut p = off + 1;
             let _total = read_varuint(buf, &mut p, body_end)?;
             let m = read_varuint(buf, &mut p, body_end)? as usize;
+            // Last-wins across sibling leaves: scan all in-range children
+            // and keep the most recently traversed match. Children are stored
+            // in run-insertion order, so the last hit is the latest write.
+            let mut latest: Option<usize> = None;
             for _ in 0..m {
                 need(buf, p + 8 + 3 * width, body_end)?;
                 p += 8;
@@ -139,10 +142,10 @@ fn lookup_in_object(
                     continue;
                 }
                 if let Some(v) = lookup_in_object(buf, child, body_end, key)? {
-                    return Ok(Some(v));
+                    latest = Some(v);
                 }
             }
-            Ok(None)
+            Ok(latest)
         }
         0x34 => Ok(None),
         _ => Err(ReadError::UnknownTag(tag)),
@@ -380,15 +383,17 @@ fn decode_object(
 ) -> Result<Value, ReadError> {
     let mut pairs = Vec::new();
     collect_object_pairs(buf, off, body_end, ctx, &mut pairs)?;
+    // Last-wins on duplicates: traversal visits children in stored order,
+    // which matches run-insertion order in the writer's cross-run cascade,
+    // so a later occurrence overwrites an earlier one. Within a single
+    // leaf the writer guarantees strict-sorted unique keys (§7.3, §8
+    // invariant 4); duplicates only ever surface across sibling leaves.
     let mut map = Map::new();
     for (k_off, v_off) in pairs {
         let k = match decode_value(buf, k_off, body_end, ctx)? {
             Value::String(s) => s,
             _ => return Err(ReadError::UnknownTag(buf[k_off])),
         };
-        if map.contains_key(&k) {
-            return Err(ReadError::DuplicateKey(k));
-        }
         let v = decode_value(buf, v_off, body_end, ctx)?;
         map.insert(k, v);
     }

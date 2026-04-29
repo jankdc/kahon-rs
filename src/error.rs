@@ -3,8 +3,8 @@ use std::io;
 
 /// Errors returned by the writer.
 ///
-/// Most variants describe API misuse (out-of-order pushes, duplicate
-/// keys) or value-shape problems (NaN floats, out-of-range integers).
+/// Most variants describe API misuse (out-of-order pushes) or
+/// value-shape problems (NaN floats, out-of-range integers).
 /// I/O failures from the underlying sink are wrapped in
 /// [`WriteError::Io`].
 ///
@@ -21,8 +21,6 @@ pub enum WriteError {
     NaNOrInfinity,
     /// A float could not be encoded losslessly in the chosen tag.
     FloatPrecisionLoss,
-    /// Two equal keys appeared within the same object flush window.
-    DuplicateKey,
     /// [`Writer::finish`](crate::Writer::finish) was called before any
     /// root value was pushed.
     EmptyDocument,
@@ -47,7 +45,6 @@ impl fmt::Display for WriteError {
             WriteError::IntegerOutOfRange => write!(f, "integer out of [-2^63, 2^64-1] range"),
             WriteError::NaNOrInfinity => write!(f, "NaN or Infinity float is not representable"),
             WriteError::FloatPrecisionLoss => write!(f, "float cannot be represented losslessly"),
-            WriteError::DuplicateKey => write!(f, "duplicate key within an object run"),
             WriteError::EmptyDocument => write!(f, "finish() called with no root value"),
             WriteError::MultipleRootValues => write!(f, "more than one root value pushed"),
             WriteError::MisuseObjectValue => write!(f, "value pushed into object without a key"),

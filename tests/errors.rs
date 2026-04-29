@@ -9,9 +9,7 @@
 //! Each test follows the same shape: drive the writer to the failure point,
 //! capture the result, assert the variant.
 
-mod common;
-
-use kahon::{WriteError, Writer, WriterOptions};
+use kahon::{WriteError, Writer};
 
 #[test]
 fn finish_with_no_root_returns_empty_document() {
@@ -38,44 +36,3 @@ fn second_top_level_push_returns_multiple_root_values() {
     );
 }
 
-#[test]
-fn duplicate_key_within_run_caught_at_close() {
-    let mut buf = Vec::new();
-    let mut w = Writer::new(&mut buf);
-    let mut o = w.start_object();
-    o.push_i64("a", 1).unwrap();
-    o.push_i64("a", 2).unwrap();
-    let res = o.end();
-    assert!(
-        matches!(res, Err(WriteError::DuplicateKey)),
-        "expected DuplicateKey, got {:?}",
-        res.err()
-    );
-}
-
-// Cross-run duplicate keys are the caller's contract per lib.rs §"Key-uniqueness
-// contract": the writer enforces within-run uniqueness only. We document the
-// contract by asserting the writer accepts the input and the strict reader
-// rejects the resulting file.
-#[test]
-fn cross_run_duplicate_produces_non_conforming_file() {
-    let mut buf = Vec::new();
-    let opts = WriterOptions {
-        object_sort_window: 1, // every key flushes its own run
-        ..Default::default()
-    };
-    {
-        let mut w = Writer::with_options(&mut buf, opts).unwrap();
-        let mut o = w.start_object();
-        o.push_i64("a", 1).unwrap();
-        o.push_i64("a", 2).unwrap();
-        o.end().unwrap();
-        w.finish().unwrap();
-    }
-    let res = common::reader::decode(&buf);
-    assert!(
-        matches!(res, Err(common::reader::ReadError::DuplicateKey(_))),
-        "expected reader DuplicateKey, got {:?}",
-        res.map(|d| d.value)
-    );
-}

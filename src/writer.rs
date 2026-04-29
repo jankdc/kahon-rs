@@ -196,13 +196,15 @@ impl ObjectState {
             return Ok(());
         }
         run.sort_by(|a, b| a.0.cmp(&b.0));
-        for w in run.windows(2) {
-            if w[0].0 == w[1].0 {
-                return Err(WriteError::DuplicateKey);
+        let mut deduped: Vec<(Vec<u8>, u64, u64)> = Vec::with_capacity(run.len());
+        for entry in run {
+            match deduped.last_mut() {
+                Some(last) if last.0 == entry.0 => *last = entry,
+                _ => deduped.push(entry),
             }
         }
         let mut builder = ObjectBPlusBuilder::new();
-        for (kb, k, v) in run {
+        for (kb, k, v) in deduped {
             builder.push(
                 ObjectLeafItem {
                     key_off: k,
