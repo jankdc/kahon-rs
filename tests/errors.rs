@@ -29,4 +29,3 @@ fn second_top_level_push_returns_multiple_root_values() {
         res.err()
     );
 }
-

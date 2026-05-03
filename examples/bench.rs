@@ -344,8 +344,8 @@ fn print_tuning(big: &Value, big_json_len: usize, big_lookups: &[String]) {
     println!("=== tuning sensitivity (big-object) ===");
     println!();
     println!(
-        "{:>8}  {:>8}  {:>10}  {:>10}   {}",
-        "fanout", "sortwin", "lookup", "peak", "note"
+        "{:>8}  {:>8}  {:>10}  {:>10}   note",
+        "fanout", "sortwin", "lookup", "peak"
     );
     println!("{}", "-".repeat(60));
 
