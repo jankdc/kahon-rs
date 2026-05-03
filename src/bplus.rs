@@ -53,9 +53,7 @@ fn projected_object_internal_bytes(entries: &[ObjEntry]) -> usize {
     let max_off = entries.iter().map(ObjEntry::max_offset).max().unwrap_or(0);
     let total: u64 = entries.iter().map(|e| e.sub_total).sum();
     let (_, width) = smallest_width(max_off);
-    1 + varuint_size(total)
-        + varuint_size(entries.len() as u64)
-        + entries.len() * (8 + 3 * width)
+    1 + varuint_size(total) + varuint_size(entries.len() as u64) + entries.len() * (8 + 3 * width)
 }
 
 fn should_flush_array_leaf(items: &[u64], sizing: &NodeSizing) -> bool {
@@ -380,7 +378,6 @@ impl ObjectCascade {
         }
         Ok(carry)
     }
-
 }
 
 /// Emit one object-internal node and fold its children's fences into the
@@ -485,7 +482,7 @@ impl ArrayBPlusBuilder {
             let off = emit_array_leaf(ctx, &leaf, &policy.align)?;
             // Append to level 1 without short-circuiting cascade: finalize
             // is the m>=2 gatekeeper.
-            while self.cascade.levels.len() < 1 {
+            while self.cascade.levels.is_empty() {
                 self.cascade.levels.push(Vec::new());
             }
             self.cascade.levels[0].push((count, off));

@@ -123,10 +123,7 @@ fn object_single_pair_matches_conformance_bytes() {
         o.push_i64("a", 1).unwrap();
         o.end().unwrap();
     });
-    assert_eq!(
-        body(&buf),
-        &[0x60, 0x61, 0x14, 0x80, 0x01, 0x06, 0x08]
-    );
+    assert_eq!(body(&buf), &[0x60, 0x61, 0x14, 0x80, 0x01, 0x06, 0x08]);
     assert_eq!(root_offset(&buf), 0x09);
 }
 

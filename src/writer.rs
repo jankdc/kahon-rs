@@ -17,7 +17,7 @@ pub enum NodeSizing {
     /// use, sizing nodes to fill (but not exceed) the target. Recommended
     /// value for disk-resident files: 4096 (one OS page). See spec §13.3.
     ///
-    /// If a single entry would exceed the target, the writer waits for a 
+    /// If a single entry would exceed the target, the writer waits for a
     /// second entry rather than emitting an `m=1` node.
     TargetBytes(usize),
 }
