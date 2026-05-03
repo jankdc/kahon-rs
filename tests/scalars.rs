@@ -18,15 +18,15 @@ fn integer_width_selection() {
         (65535, 0x41),
         (65536, 0x42), // UInt32 low
         (4_294_967_295, 0x42),
-        (4_294_967_296, 0x43), // UInt64 low — scalar/uint64-2pow32
+        (4_294_967_296, 0x43), // UInt64 low - scalar/uint64-2pow32
         (u64::MAX as i128, 0x43),
         (-17, 0x44), // Int8 low
         (-128, 0x44),
-        (-129, 0x45), // Int16 low — scalar/int16-neg129
+        (-129, 0x45), // Int16 low - scalar/int16-neg129
         (-32768, 0x45),
-        (-32769, 0x46), // Int32 low — scalar/int32-neg32769
+        (-32769, 0x46), // Int32 low - scalar/int32-neg32769
         (-2_147_483_648, 0x46),
-        (-2_147_483_649, 0x47), // Int64 low — scalar/int64-neg2pow31m1
+        (-2_147_483_649, 0x47), // Int64 low - scalar/int64-neg2pow31m1
         (i64::MIN as i128, 0x47),
     ];
     for &(v, tag) in cases {

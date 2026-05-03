@@ -61,7 +61,7 @@
 //!
 //! Builders close their container on `Drop`, which is convenient for the
 //! happy path. If the close encounters a write error, however, `Drop`
-//! has nowhere to surface it — the writer is poisoned and the error is
+//! has nowhere to surface it - the writer is poisoned and the error is
 //! reported on the next operation (or on [`Writer::finish`]).
 //!
 //! Call [`ArrayBuilder::end`] or [`ObjectBuilder::end`] to close

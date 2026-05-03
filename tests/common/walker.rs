@@ -93,6 +93,6 @@ fn walk(buf: &[u8], off: usize) {
                 walk(buf, child as usize);
             }
         }
-        _ => { /* scalar / string / empty container — terminal */ }
+        _ => { /* scalar / string / empty container - terminal */ }
     }
 }
