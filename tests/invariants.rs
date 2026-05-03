@@ -23,7 +23,7 @@ fn build_with<F: FnOnce(&mut Writer<&mut Vec<u8>>)>(opts: WriterOptions, f: F) -
 #[test]
 fn array_with_uneven_levels_keeps_m_at_least_2() {
     // fanout=2, 5 items: leaves [2,2,1] would naively climb to an m=1 node.
-    // Array path bubbles the lone pair up — must stay valid.
+    // Array path bubbles the lone pair up - must stay valid.
     let opts = WriterOptions {
         policy: BuildPolicy::compact(2),
         ..Default::default()

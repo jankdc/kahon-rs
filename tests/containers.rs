@@ -95,7 +95,7 @@ fn array_with_small_fanout_produces_internal_node() {
 #[test]
 fn array_spills_leaf_to_sink_once_fanout_is_reached() {
     // With fanout=2, the second push closes the leaf and writes it through
-    // to the sink — bytes_written must advance past just the raw scalars.
+    // to the sink - bytes_written must advance past just the raw scalars.
     let opts = WriterOptions {
         policy: BuildPolicy::compact(2),
         ..Default::default()
@@ -132,7 +132,7 @@ fn object_single_pair_matches_conformance_bytes() {
 
 #[test]
 fn object_two_sorted_emits_kv_interleaved() {
-    // {"a":1,"b":2} — both layouts are spec-conforming. The upstream
+    // {"a":1,"b":2} - both layouts are spec-conforming. The upstream
     // conformance vector container/object-two-sorted groups keys then values
     // ([60 61 60 62 14 15 80 02 06 0A 08 0B]); this writer streams k,v,k,v
     // because each value is emitted before the next key. The leaf still

@@ -322,7 +322,7 @@ fn print_baseline(workloads: &[Workload<'_>]) {
     for w in workloads {
         let r = run_one(w.doc, WriterOptions::default(), w.lookup_keys, w.json_size);
         let thru_bps = (w.json_size as f64 / r.write.as_secs_f64()) as usize;
-        let lookup = r.lookup.map(fmt_time).unwrap_or_else(|| "—".to_string());
+        let lookup = r.lookup.map(fmt_time).unwrap_or_else(|| "-".to_string());
         println!(
             "{:>16}  {:>10}  {:>9}  {:>9}/s  {:>9}  {:>9}  {:>10}  {:>9}",
             w.label,

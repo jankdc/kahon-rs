@@ -146,7 +146,7 @@ struct ObjectState {
     current_run: Vec<(Vec<u8>, u64, u64)>, // key_bytes, key_off, val_off
     /// Streaming cross-run merge tree. Each completed run pushes one
     /// `ObjEntry` here; the cascade auto-flushes a level when it reaches
-    /// fanout, so memory is bounded by O(depth × fanout × key_size) — not
+    /// fanout, so memory is bounded by O(depth × fanout × key_size) - not
     /// by total run count.
     runs_cascade: ObjectCascade,
     pending_key: Option<(Vec<u8>, u64)>,
@@ -220,7 +220,7 @@ impl ObjectState {
         // Stream the run's root entry into the cross-run cascade. The
         // cascade's `should_flush_object_internal` predicate auto-emits an
         // internal node once a level fills, so memory stays bounded by the
-        // cascade depth — independent of run count.
+        // cascade depth - independent of run count.
         self.runs_cascade.push(1, entry, policy, ctx)
     }
 
@@ -239,7 +239,7 @@ impl ObjectState {
             self.flush_run(policy, ctx)?;
         }
         // The cascade's `finalize` bubbles a lone entry up as a carry without
-        // emitting a wrapper — preserving the "single run is the root" fast
+        // emitting a wrapper - preserving the "single run is the root" fast
         // path naturally.
         match self.runs_cascade.finalize(policy, ctx)? {
             None => {
@@ -261,8 +261,8 @@ enum Frame {
 /// Streaming writer for a single Kahon document.
 ///
 /// A `Writer` wraps any [`Sink`] (every [`std::io::Write`] qualifies) and
-/// lets you push exactly one root value — a scalar, an array, or an
-/// object — before [`finish`](Writer::finish) emits the trailer.
+/// lets you push exactly one root value - a scalar, an array, or an
+/// object - before [`finish`](Writer::finish) emits the trailer.
 ///
 /// Values are written as they arrive; container nodes are buffered only
 /// until they fill (per [`BuildPolicy`]) and then flushed. Peak memory
