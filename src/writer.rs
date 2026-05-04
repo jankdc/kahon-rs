@@ -238,8 +238,13 @@ impl<S: Sink> Writer<S> {
         let Some(frame @ Frame::Array(_)) = self.frames.pop() else {
             unreachable!("top frame is not an array")
         };
-        let policy = self.opts.policy.clone();
-        let root_off = close_frame(frame, &policy, &mut self.ctx())?;
+        let mut ctx = WriteCtx {
+            sink: &mut self.sink,
+            pos: &mut self.pos,
+            scratch: &mut self.scratch,
+            padding_written: &mut self.padding_written,
+        };
+        let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
         self.register_value(root_off)
     }
 
@@ -250,8 +255,13 @@ impl<S: Sink> Writer<S> {
         let Some(frame @ Frame::Object(_)) = self.frames.pop() else {
             unreachable!("top frame is not an object")
         };
-        let policy = self.opts.policy.clone();
-        let root_off = close_frame(frame, &policy, &mut self.ctx())?;
+        let mut ctx = WriteCtx {
+            sink: &mut self.sink,
+            pos: &mut self.pos,
+            scratch: &mut self.scratch,
+            padding_written: &mut self.padding_written,
+        };
+        let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
         self.register_value(root_off)
     }
 
@@ -267,16 +277,6 @@ impl<S: Sink> Writer<S> {
             return Err(WriteError::Poisoned);
         }
         Ok(())
-    }
-
-    /// Bundle a fresh `WriteCtx` over the writer's owned state.
-    fn ctx(&mut self) -> WriteCtx<'_, S> {
-        WriteCtx {
-            sink: &mut self.sink,
-            pos: &mut self.pos,
-            scratch: &mut self.scratch,
-            padding_written: &mut self.padding_written,
-        }
     }
 
     /// Serialize a scalar into `scratch` and emit it via callback.
@@ -296,10 +296,8 @@ impl<S: Sink> Writer<S> {
     /// Route a completed value's offset to the current context: the root slot,
     /// an open array frame, or an open object frame awaiting a key.
     fn register_value(&mut self, off: u64) -> Result<(), WriteError> {
-        let policy = self.opts.policy.clone();
         let run_buffer = self.opts.object_sort_window;
-        // Disjoint borrows: frames is taken via last_mut(); ctx borrows the
-        // other writer fields directly.
+        let policy = &self.opts.policy;
         let mut ctx = WriteCtx {
             sink: &mut self.sink,
             pos: &mut self.pos,
@@ -314,8 +312,8 @@ impl<S: Sink> Writer<S> {
                 self.root_offset = Some(off);
                 Ok(())
             }
-            Some(Frame::Array(a)) => a.push(off, &policy, &mut ctx),
-            Some(Frame::Object(o)) => o.accept_value(off, run_buffer, &policy, &mut ctx),
+            Some(Frame::Array(a)) => a.push(off, policy, &mut ctx),
+            Some(Frame::Object(o)) => o.accept_value(off, run_buffer, policy, &mut ctx),
         }
     }
 }
