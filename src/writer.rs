@@ -1,262 +1,11 @@
 use crate::align::write_padding;
-use crate::bplus::{ArrayBPlusBuilder, ObjectBPlusBuilder, ObjectCascade, ObjectLeafItem};
+use crate::bplus::ArrayBPlusBuilder;
+use crate::config::{PageAlignment, WriterOptions};
 use crate::encode::{write_f64, write_false, write_integer, write_null, write_string, write_true};
 use crate::error::WriteError;
+use crate::frame::{close_frame, Frame, ObjectState};
 use crate::sink::{Sink, WriteCtx};
-use crate::types::{EMPTY_ARRAY, EMPTY_OBJECT, FLAGS, MAGIC, VERSION};
-
-/// How the writer decides when to close a B+tree node and flush it to disk.
-#[derive(Clone, Debug)]
-pub enum NodeSizing {
-    /// Fixed entry-count cap. Predictable, smallest files. Each leaf or
-    /// internal node closes once it accumulates `n` entries.
-    Fanout(usize),
-
-    /// Target on-disk byte budget per node. The writer derives an
-    /// effective fanout per flush from the offset width currently in
-    /// use, sizing nodes to fill (but not exceed) the target. Recommended
-    /// value for disk-resident files: 4096 (one OS page). See spec §13.3.
-    ///
-    /// If a single entry would exceed the target, the writer waits for a
-    /// second entry rather than emitting an `m=1` node.
-    TargetBytes(usize),
-}
-
-/// Whether to pad the body for page-cache friendliness on disk.
-///
-/// Padding bytes are `Null` tags (`0x00`) that no offset references; they
-/// are invisible to a reader that traverses the document by following
-/// offsets from the root.
-#[derive(Clone, Debug)]
-pub enum PageAlignment {
-    /// No padding. Tightest file size; preferred for in-memory or
-    /// network use where cache locality is not a concern.
-    None,
-
-    /// Pad so that:
-    ///   1. No container node ≤ `page_size` straddles a page boundary.
-    ///   2. The 12-byte trailer lands in the file's last `page_size`-aligned
-    ///      page, i.e. `file_size % page_size == 0`.
-    Aligned { page_size: usize },
-}
-
-/// Bundle of layout knobs threaded through B+tree construction.
-///
-/// Combine via [`BuildPolicy::compact`] (in-memory friendly) or
-/// [`BuildPolicy::disk_aligned`] (file-backed), or build directly from
-/// [`NodeSizing`] and [`PageAlignment`] for fine control.
-#[derive(Clone, Debug)]
-pub struct BuildPolicy {
-    /// How node fanout is decided when flushing.
-    pub sizing: NodeSizing,
-    /// Whether to pad container layout for page-cache friendliness.
-    pub align: PageAlignment,
-}
-
-impl BuildPolicy {
-    /// Minimum sane `TargetBytes`. Below 64, internal nodes can't fit two
-    /// entries at W=8 with header overhead, which would force violations
-    /// of the `m >= 2` floor.
-    pub const MIN_TARGET_BYTES: usize = 64;
-
-    /// Tight, predictable layout: fixed fanout, no padding. Best for
-    /// fixture tests and in-memory pipelines.
-    pub fn compact(fanout: usize) -> Self {
-        Self {
-            sizing: NodeSizing::Fanout(fanout),
-            align: PageAlignment::None,
-        }
-    }
-
-    /// Disk-tuned layout: each node targets one page, trailer is
-    /// page-aligned. Suitable default for files that will be `pread`-ed
-    /// or memory-mapped.
-    pub fn disk_aligned(page_size: usize) -> Self {
-        Self {
-            sizing: NodeSizing::TargetBytes(page_size),
-            align: PageAlignment::Aligned { page_size },
-        }
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), WriteError> {
-        match self.sizing {
-            NodeSizing::Fanout(f) if f < 2 => {
-                return Err(WriteError::InvalidOption(
-                    "fanout must be >= 2 (spec §8 invariant 3)",
-                ));
-            }
-            NodeSizing::TargetBytes(t) if t < Self::MIN_TARGET_BYTES => {
-                return Err(WriteError::InvalidOption("target_node_bytes must be >= 64"));
-            }
-            _ => {}
-        }
-        if let PageAlignment::Aligned { page_size } = self.align {
-            if !page_size.is_power_of_two() || page_size < 64 {
-                return Err(WriteError::InvalidOption(
-                    "page_size must be a power of two and >= 64",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Default for BuildPolicy {
-    fn default() -> Self {
-        // In-memory friendly out of the box: fixed fanout, no padding,
-        // tightest output. Opt into `disk_aligned(page_size)` for files
-        // that will be `pread`-ed or memory-mapped.
-        Self::compact(128)
-    }
-}
-
-/// Top-level writer configuration.
-///
-/// Combine with [`Writer::with_options`] to override the defaults.
-/// `WriterOptions::default()` gives an in-memory–friendly setup
-/// (fixed fanout, no padding, tightest output).
-#[derive(Clone, Debug)]
-pub struct WriterOptions {
-    /// Max entries buffered (and sorted) per object run before flushing.
-    /// Larger values give modestly faster keyed lookups (fewer runs to walk
-    /// at internal nodes) at proportional memory cost. Sweet spot is roughly
-    /// the effective fanout squared; below that, lookups pay; above, you
-    /// only burn memory.
-    pub object_sort_window: usize,
-
-    /// Node-sizing and page-alignment knobs. See [`BuildPolicy`].
-    pub policy: BuildPolicy,
-}
-
-impl Default for WriterOptions {
-    fn default() -> Self {
-        Self {
-            object_sort_window: 16_384,
-            policy: BuildPolicy::default(),
-        }
-    }
-}
-
-// ============================================================================
-// Frame state
-// ============================================================================
-
-#[derive(Default)]
-struct ObjectState {
-    current_run: Vec<(Vec<u8>, u64, u64)>, // key_bytes, key_off, val_off
-    /// Streaming cross-run merge tree. Each completed run pushes one
-    /// `ObjEntry` here; the cascade auto-flushes a level when it reaches
-    /// fanout, so memory is bounded by O(depth × fanout × key_size) - not
-    /// by total run count.
-    runs_cascade: ObjectCascade,
-    pending_key: Option<(Vec<u8>, u64)>,
-    /// Sum of `kb.capacity()` across `current_run`. Maintained incrementally
-    /// so `Writer::buffered_bytes()` is O(1) instead of O(current_run.len()).
-    current_run_key_bytes: usize,
-}
-
-impl ObjectState {
-    fn set_pending_key(&mut self, key_bytes: Vec<u8>, key_off: u64) {
-        debug_assert!(
-            self.pending_key.is_none(),
-            "ObjectBuilder consumes pending_key on every push; double-set is unreachable"
-        );
-        self.pending_key = Some((key_bytes, key_off));
-    }
-
-    /// Pair a just-emitted value offset with the pending key; flush the run
-    /// once it reaches `run_buffer`.
-    fn accept_value<S: Sink>(
-        &mut self,
-        val_off: u64,
-        run_buffer: usize,
-        policy: &BuildPolicy,
-        ctx: &mut WriteCtx<'_, S>,
-    ) -> Result<(), WriteError> {
-        let (kb, koff) = self.pending_key.take().expect(
-            "ObjectBuilder always sets pending_key before producing a value; None is unreachable",
-        );
-        self.current_run_key_bytes += kb.capacity();
-        self.current_run.push((kb, koff, val_off));
-        if self.current_run.len() >= run_buffer {
-            self.flush_run(policy, ctx)?;
-        }
-        Ok(())
-    }
-
-    fn flush_run<S: Sink>(
-        &mut self,
-        policy: &BuildPolicy,
-        ctx: &mut WriteCtx<'_, S>,
-    ) -> Result<(), WriteError> {
-        let mut run = std::mem::take(&mut self.current_run);
-        self.current_run_key_bytes = 0;
-        if run.is_empty() {
-            return Ok(());
-        }
-        run.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut deduped: Vec<(Vec<u8>, u64, u64)> = Vec::with_capacity(run.len());
-        for entry in run {
-            match deduped.last_mut() {
-                Some(last) if last.0 == entry.0 => *last = entry,
-                _ => deduped.push(entry),
-            }
-        }
-        let mut builder = ObjectBPlusBuilder::new();
-        for (kb, k, v) in deduped {
-            builder.push(
-                ObjectLeafItem {
-                    key_off: k,
-                    val_off: v,
-                    key_bytes: kb,
-                },
-                policy,
-                ctx,
-            )?;
-        }
-        let entry = builder
-            .finalize(policy, ctx)?
-            .expect("non-empty run yields a root");
-        // Stream the run's root entry into the cross-run cascade. The
-        // cascade's `should_flush_object_internal` predicate auto-emits an
-        // internal node once a level fills, so memory stays bounded by the
-        // cascade depth - independent of run count.
-        self.runs_cascade.push(1, entry, policy, ctx)
-    }
-
-    /// Flush the pending run (if any) and return the object root offset.
-    /// Writes the `EMPTY_OBJECT` singleton if nothing was ever pushed.
-    fn finalize<S: Sink>(
-        mut self,
-        policy: &BuildPolicy,
-        ctx: &mut WriteCtx<'_, S>,
-    ) -> Result<u64, WriteError> {
-        debug_assert!(
-            self.pending_key.is_none(),
-            "ObjectBuilder consumes pending_key before close; Some is unreachable"
-        );
-        if !self.current_run.is_empty() {
-            self.flush_run(policy, ctx)?;
-        }
-        // The cascade's `finalize` bubbles a lone entry up as a carry without
-        // emitting a wrapper - preserving the "single run is the root" fast
-        // path naturally.
-        match self.runs_cascade.finalize(policy, ctx)? {
-            None => {
-                let off = *ctx.pos;
-                ctx.sink.write_all(&[EMPTY_OBJECT])?;
-                *ctx.pos += 1;
-                Ok(off)
-            }
-            Some(root) => Ok(root.node_off),
-        }
-    }
-}
-
-enum Frame {
-    Array(ArrayBPlusBuilder),
-    Object(ObjectState),
-}
+use crate::types::{FLAGS, MAGIC, VERSION};
 
 /// Streaming writer for a single Kahon document.
 ///
@@ -270,13 +19,13 @@ enum Frame {
 ///
 /// See the [crate-level docs](crate) for a full example.
 pub struct Writer<S: Sink> {
-    sink: S,
-    pos: u64,
+    pub(crate) sink: S,
+    pub(crate) pos: u64,
     scratch: Vec<u8>,
-    padding_written: u64,
-    frames: Vec<Frame>,
-    opts: WriterOptions,
-    root_offset: Option<u64>,
+    pub(crate) padding_written: u64,
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) opts: WriterOptions,
+    pub(crate) root_offset: Option<u64>,
     pub(crate) poisoned: bool,
 }
 
@@ -457,22 +206,6 @@ impl<S: Sink> Writer<S> {
         self.register_value(off)
     }
 
-    /// Open an array. The returned [`ArrayBuilder`](crate::ArrayBuilder) borrows the writer
-    /// mutably; close it via `.end()` (errors propagated) or by drop
-    /// (errors poison the writer).
-    pub fn start_array(&mut self) -> crate::builder::ArrayBuilder<'_, S> {
-        self.push_array_frame();
-        crate::builder::ArrayBuilder::new(self)
-    }
-
-    /// Open an object. The returned [`ObjectBuilder`](crate::ObjectBuilder) borrows the writer
-    /// mutably; close it via `.end()` (errors propagated) or by drop
-    /// (errors poison the writer).
-    pub fn start_object(&mut self) -> crate::builder::ObjectBuilder<'_, S> {
-        self.push_object_frame();
-        crate::builder::ObjectBuilder::new(self)
-    }
-
     pub(crate) fn push_array_frame(&mut self) {
         self.frames.push(Frame::Array(ArrayBPlusBuilder::new()));
     }
@@ -502,21 +235,11 @@ impl<S: Sink> Writer<S> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        let Some(Frame::Array(builder)) = self.frames.pop() else {
+        let Some(frame @ Frame::Array(_)) = self.frames.pop() else {
             unreachable!("top frame is not an array")
         };
-        // Borrow opts.policy through a snapshot pointer-copy to avoid
-        // overlapping borrows with self.ctx().
         let policy = self.opts.policy.clone();
-        let root_off = match builder.finalize(&policy, &mut self.ctx())? {
-            Some((_, off)) => off,
-            None => {
-                let off = self.pos;
-                self.sink.write_all(&[EMPTY_ARRAY])?;
-                self.pos += 1;
-                off
-            }
-        };
+        let root_off = close_frame(frame, &policy, &mut self.ctx())?;
         self.register_value(root_off)
     }
 
@@ -524,11 +247,11 @@ impl<S: Sink> Writer<S> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        let Some(Frame::Object(obj)) = self.frames.pop() else {
+        let Some(frame @ Frame::Object(_)) = self.frames.pop() else {
             unreachable!("top frame is not an object")
         };
         let policy = self.opts.policy.clone();
-        let root_off = obj.finalize(&policy, &mut self.ctx())?;
+        let root_off = close_frame(frame, &policy, &mut self.ctx())?;
         self.register_value(root_off)
     }
 

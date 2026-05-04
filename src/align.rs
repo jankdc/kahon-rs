@@ -2,9 +2,9 @@
 //! trailer writer. Padding bytes are unreferenced `Null` tags (`0x00`),
 //! invisible to readers following offsets.
 
+use crate::config::PageAlignment;
 use crate::error::WriteError;
 use crate::sink::{Sink, WriteCtx};
-use crate::writer::PageAlignment;
 
 const PAD_CHUNK: [u8; 256] = [0u8; 256];
 

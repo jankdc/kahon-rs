@@ -1,6 +1,25 @@
+use crate::checkpoint::Checkpoint;
 use crate::error::WriteError;
-use crate::sink::Sink;
+use crate::sink::{RewindableSink, Sink};
 use crate::writer::Writer;
+
+impl<S: Sink> Writer<S> {
+    /// Open an array. The returned [`ArrayBuilder`] borrows the writer
+    /// mutably; close it via `.end()` (errors propagated) or by drop
+    /// (errors poison the writer).
+    pub fn start_array(&mut self) -> ArrayBuilder<'_, S> {
+        self.push_array_frame();
+        ArrayBuilder::new(self)
+    }
+
+    /// Open an object. The returned [`ObjectBuilder`] borrows the writer
+    /// mutably; close it via `.end()` (errors propagated) or by drop
+    /// (errors poison the writer).
+    pub fn start_object(&mut self) -> ObjectBuilder<'_, S> {
+        self.push_object_frame();
+        ObjectBuilder::new(self)
+    }
+}
 
 /// Handle for building an array. Borrows its parent `Writer` mutably; drops
 /// close the array automatically. Use [`ArrayBuilder::end`] for explicit,
@@ -74,6 +93,17 @@ impl<S: Sink> Drop for ArrayBuilder<'_, S> {
         if !self.closed && self.w.close_array_frame().is_err() {
             self.w.poisoned = true;
         }
+    }
+}
+
+impl<S: RewindableSink> ArrayBuilder<'_, S> {
+    /// See [`Writer::checkpoint`].
+    pub fn checkpoint(&mut self) -> Checkpoint {
+        self.w.checkpoint()
+    }
+    /// See [`Writer::rollback`].
+    pub fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
+        self.w.rollback(cp)
     }
 }
 
@@ -156,5 +186,16 @@ impl<S: Sink> Drop for ObjectBuilder<'_, S> {
         if !self.closed && self.w.close_object_frame().is_err() {
             self.w.poisoned = true;
         }
+    }
+}
+
+impl<S: RewindableSink> ObjectBuilder<'_, S> {
+    /// See [`Writer::checkpoint`].
+    pub fn checkpoint(&mut self) -> Checkpoint {
+        self.w.checkpoint()
+    }
+    /// See [`Writer::rollback`].
+    pub fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
+        self.w.rollback(cp)
     }
 }

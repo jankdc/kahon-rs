@@ -9,11 +9,11 @@
 //! lexicographically).
 
 use crate::align::pad_for_node;
+use crate::config::{BuildPolicy, NodeSizing, PageAlignment};
 use crate::encode::{smallest_width, write_uintw, write_varuint};
 use crate::error::WriteError;
 use crate::sink::{Sink, WriteCtx};
 use crate::types::{ARRAY_INTERNAL_TAG, ARRAY_LEAF_TAG, OBJECT_INTERNAL_TAG, OBJECT_LEAF_TAG};
-use crate::writer::{BuildPolicy, NodeSizing, PageAlignment};
 
 // ============================================================================
 // Size predicates
@@ -221,7 +221,7 @@ fn emit_object_internal<S: Sink>(
 // Array internal-level cascade
 // ============================================================================
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ArrayCascade {
     levels: Vec<Vec<(u64, u64)>>,
 }
@@ -314,7 +314,7 @@ impl ObjEntry {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ObjectCascade {
     levels: Vec<Vec<ObjEntry>>,
 }
@@ -420,6 +420,7 @@ fn emit_and_merge_object<S: Sink>(
 // Array B+tree builder
 // ============================================================================
 
+#[derive(Clone)]
 pub(crate) struct ArrayBPlusBuilder {
     leaf: Vec<u64>,
     cascade: ArrayCascade,

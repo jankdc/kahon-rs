@@ -27,6 +27,12 @@ pub enum WriteError {
     Poisoned,
     /// [`WriterOptions`](crate::WriterOptions) failed validation.
     InvalidOption(&'static str),
+    /// A [`Checkpoint`](crate::Checkpoint) was passed to
+    /// [`rollback`](crate::Writer::rollback) when the writer's frame
+    /// depth or byte position no longer matched the checkpoint - usually
+    /// because a sub-builder opened after the checkpoint was taken is
+    /// still alive, or the checkpoint belongs to a different writer.
+    InvalidCheckpoint,
 }
 
 impl fmt::Display for WriteError {
@@ -38,6 +44,12 @@ impl fmt::Display for WriteError {
             WriteError::MultipleRootValues => write!(f, "more than one root value pushed"),
             WriteError::Poisoned => write!(f, "writer poisoned by prior error"),
             WriteError::InvalidOption(s) => write!(f, "invalid writer option: {}", s),
+            WriteError::InvalidCheckpoint => {
+                write!(
+                    f,
+                    "checkpoint depth or position does not match writer state"
+                )
+            }
         }
     }
 }

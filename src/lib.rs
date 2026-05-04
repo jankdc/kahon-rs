@@ -110,16 +110,21 @@
 mod align;
 mod bplus;
 mod builder;
+mod checkpoint;
+mod config;
 mod encode;
 mod error;
+mod frame;
 mod sink;
 mod types;
 mod writer;
 
 pub use builder::{ArrayBuilder, ObjectBuilder};
+pub use checkpoint::{Checkpoint, TrailerSnapshot};
+pub use config::{BuildPolicy, NodeSizing, PageAlignment, WriterOptions};
 pub use error::WriteError;
-pub use sink::Sink;
-pub use writer::{BuildPolicy, NodeSizing, PageAlignment, Writer, WriterOptions};
+pub use sink::{RewindableSink, Sink};
+pub use writer::Writer;
 
 /// Convenience alias for `std::result::Result<T, WriteError>`.
 pub type Result<T> = std::result::Result<T, WriteError>;
