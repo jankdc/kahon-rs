@@ -1,6 +1,24 @@
 use crate::error::WriteError;
-use crate::sink::Sink;
+use crate::sink::{RewindableSink, Sink};
 use crate::writer::Writer;
+
+impl<S: Sink> Writer<S> {
+    /// Open an array. The returned [`ArrayBuilder`] borrows the writer
+    /// mutably; close it via `.end()` (errors propagated) or by drop
+    /// (errors poison the writer).
+    pub fn start_array(&mut self) -> ArrayBuilder<'_, S> {
+        self.push_array_frame();
+        ArrayBuilder::new(self)
+    }
+
+    /// Open an object. The returned [`ObjectBuilder`] borrows the writer
+    /// mutably; close it via `.end()` (errors propagated) or by drop
+    /// (errors poison the writer).
+    pub fn start_object(&mut self) -> ObjectBuilder<'_, S> {
+        self.push_object_frame();
+        ObjectBuilder::new(self)
+    }
+}
 
 /// Handle for building an array. Borrows its parent `Writer` mutably; drops
 /// close the array automatically. Use [`ArrayBuilder::end`] for explicit,
@@ -73,6 +91,35 @@ impl<S: Sink> Drop for ArrayBuilder<'_, S> {
     fn drop(&mut self) {
         if !self.closed && self.w.close_array_frame().is_err() {
             self.w.poisoned = true;
+        }
+    }
+}
+
+impl<S: RewindableSink> ArrayBuilder<'_, S> {
+    /// See [`Writer::try_write`]. Runs `f` with this builder; keeps the
+    /// writes on `Ok`, rolls them back on `Err`. Any nested builders
+    /// opened inside `f` must close before `f` returns (the borrow
+    /// checker enforces this).
+    pub fn try_write<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<WriteError>,
+    {
+        if self.w.poisoned {
+            return Err(E::from(WriteError::Poisoned));
+        }
+        let cp = self.w.checkpoint();
+        match f(self) {
+            Ok(v) => {
+                drop(cp);
+                Ok(v)
+            }
+            Err(e) => {
+                if let Err(rb) = self.w.rollback(cp) {
+                    return Err(E::from(rb));
+                }
+                Err(e)
+            }
         }
     }
 }
@@ -155,6 +202,35 @@ impl<S: Sink> Drop for ObjectBuilder<'_, S> {
     fn drop(&mut self) {
         if !self.closed && self.w.close_object_frame().is_err() {
             self.w.poisoned = true;
+        }
+    }
+}
+
+impl<S: RewindableSink> ObjectBuilder<'_, S> {
+    /// See [`Writer::try_write`]. Runs `f` with this builder; keeps the
+    /// writes on `Ok`, rolls them back on `Err`. Any nested builders
+    /// opened inside `f` must close before `f` returns (the borrow
+    /// checker enforces this).
+    pub fn try_write<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<WriteError>,
+    {
+        if self.w.poisoned {
+            return Err(E::from(WriteError::Poisoned));
+        }
+        let cp = self.w.checkpoint();
+        match f(self) {
+            Ok(v) => {
+                drop(cp);
+                Ok(v)
+            }
+            Err(e) => {
+                if let Err(rb) = self.w.rollback(cp) {
+                    return Err(E::from(rb));
+                }
+                Err(e)
+            }
         }
     }
 }
