@@ -1,14 +1,9 @@
-//! Checkpoint primitives and snapshot trailer.
+//! Speculative writes and snapshot trailer.
 //!
-//! [`Checkpoint`] captures writer state so [`Writer::rollback`] can undo
-//! everything written since. [`SnapshotTrailer`] synthesises the closing
-//! bytes for an in-progress document so a reader can see a complete kahon
-//! file without waiting for `finish()`.
+//! [`Writer::try_write`] runs a closure within a save/restore boundary:
+//! `Ok` keeps the writes, `Err` rolls everything back including the poison
+//! flag.
 //!
-//! Both are powered by the same primitive: cloning the frame stack and
-//! replaying state. Rollback restores the cloned stack onto the live writer;
-//! `snapshot_trailer` drives a clone to closure into a side buffer, leaving
-//! the live writer untouched.
 
 use crate::align::write_padding;
 use crate::config::PageAlignment;
@@ -76,32 +71,14 @@ impl TrailerSnapshot {
     }
 }
 
-/// A snapshot of writer state taken by [`Writer::checkpoint`].
-///
-/// Pass to [`Writer::rollback`] to discard everything written since the
-/// checkpoint and restore the writer's frame stack, byte position, and
-/// padding counter. To keep the writes, simply drop the `Checkpoint` - the
-/// sink already holds the bytes; nothing else needs to happen.
-///
-/// Holds owned data; carries no borrow of the [`Writer`].
-///
-/// # Misuse
-///
-/// `rollback` validates that the checkpoint matches the writer's current
-/// frame depth and that its captured position is `<=` the current position.
-/// Mismatches return [`WriteError::InvalidCheckpoint`]. The two failure
-/// modes the check catches:
-///
-/// - The checkpoint was taken at a shallower frame depth than the current
-///   builder (e.g., a sub-builder calling `rollback` on its parent's
-///   checkpoint while still alive).
-/// - The checkpoint's position is no longer reachable - usually because a
-///   later rollback already discarded those bytes.
-pub struct Checkpoint {
+/// Internal save-state for [`Writer::try_write`]. Captures the
+/// information needed to roll the writer back to the call site.
+pub(crate) struct Checkpoint {
     pos: u64,
     padding_written: u64,
     root_offset: Option<u64>,
     frames: Vec<Frame>,
+    poisoned: bool,
 }
 
 impl<S: Sink> Writer<S> {
@@ -207,43 +184,85 @@ impl<S: Sink> Writer<S> {
 }
 
 impl<S: RewindableSink> Writer<S> {
-    /// Snapshot the writer's current state. Pass the returned [`Checkpoint`]
-    /// to [`Writer::rollback`] to undo writes made since this call, or drop
-    /// it to keep the writes (the sink already holds the bytes).
+    /// Run `f` as a speculative write. If `f` returns `Ok`, the writes are
+    /// kept; if `Err`, every byte written and every frame opened since
+    /// the call is rolled back (poison flag included) and the error is
+    /// propagated.
     ///
-    /// May be called at any frame depth; works inside an open
-    /// [`ArrayBuilder`](crate::ArrayBuilder) or
-    /// [`ObjectBuilder`](crate::ObjectBuilder) via the `checkpoint` method
-    /// on those types. Nesting is supported in both directions: a checkpoint
-    /// taken inside another checkpoint, and a checkpoint taken while a
-    /// container builder is open.
-    pub fn checkpoint(&mut self) -> Checkpoint {
+    /// ```ignore
+    /// w.try_write(|w| {
+    ///     w.push_str(&candidate)?;
+    ///     if !is_valid(&candidate) { return Err(MyErr::Invalid); }
+    ///     Ok(())
+    /// })?;
+    /// ```
+    ///
+    /// # What `try_write` does *not* do
+    ///
+    /// Despite the rollback semantics, this is **not** a database
+    /// transaction. Specifically:
+    ///
+    /// - **There is no durability.** `try_write` does not flush or
+    ///   fsync; an `Ok` return only means the bytes were accepted by the
+    ///   sink. Use [`finish`](Self::finish) plus your own flush/fsync.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriteError::Poisoned`] if the writer is already poisoned at
+    ///   entry. Like every other op, `try_write` refuses to run on a
+    ///   poisoned writer; once poisoned, the document is unrecoverable.
+    /// - If `f` returns `Err`, `try_write` rolls back and propagates the
+    ///   error. If rollback itself fails (sink truncate I/O error), the
+    ///   writer is poisoned and the I/O error is returned via
+    ///   `E::from(WriteError)`. The `E: From<WriteError>` bound exists
+    ///   for this conversion; in practice, error enums that already
+    ///   carry a `WriteError` variant satisfy it for free.
+    pub fn try_write<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<WriteError>,
+    {
+        if self.poisoned {
+            return Err(E::from(WriteError::Poisoned));
+        }
+
+        let cp = self.checkpoint();
+        match f(self) {
+            Ok(v) => {
+                drop(cp);
+                Ok(v)
+            }
+            Err(e) => {
+                if let Err(rb) = self.rollback(cp) {
+                    return Err(E::from(rb));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn checkpoint(&mut self) -> Checkpoint {
         Checkpoint {
             pos: self.pos,
             padding_written: self.padding_written,
             root_offset: self.root_offset,
             frames: self.frames.clone(),
+            poisoned: self.poisoned,
         }
     }
 
-    /// Discard everything written since `cp` was taken and restore the
-    /// writer's frame stack, byte position, and padding counter.
-    ///
-    /// Returns [`WriteError::InvalidCheckpoint`] if the checkpoint's frame
-    /// depth doesn't match the writer's current depth, or if its captured
-    /// position is greater than the current position. See [`Checkpoint`].
-    pub fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
-        if self.poisoned {
-            return Err(WriteError::Poisoned);
+    pub(crate) fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
+        if let Err(e) = self.sink.rewind_to(cp.pos) {
+            // Sink and in-memory state are now inconsistent. Refuse to
+            // continue silently.
+            self.poisoned = true;
+            return Err(WriteError::Io(e));
         }
-        if cp.pos > self.pos || cp.frames.len() != self.frames.len() {
-            return Err(WriteError::InvalidCheckpoint);
-        }
-        self.sink.rewind_to(cp.pos)?;
         self.pos = cp.pos;
         self.padding_written = cp.padding_written;
         self.root_offset = cp.root_offset;
         self.frames = cp.frames;
+        self.poisoned = cp.poisoned;
         Ok(())
     }
 }

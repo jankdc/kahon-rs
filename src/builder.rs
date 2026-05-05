@@ -1,4 +1,3 @@
-use crate::checkpoint::Checkpoint;
 use crate::error::WriteError;
 use crate::sink::{RewindableSink, Sink};
 use crate::writer::Writer;
@@ -97,13 +96,31 @@ impl<S: Sink> Drop for ArrayBuilder<'_, S> {
 }
 
 impl<S: RewindableSink> ArrayBuilder<'_, S> {
-    /// See [`Writer::checkpoint`].
-    pub fn checkpoint(&mut self) -> Checkpoint {
-        self.w.checkpoint()
-    }
-    /// See [`Writer::rollback`].
-    pub fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
-        self.w.rollback(cp)
+    /// See [`Writer::try_write`]. Runs `f` with this builder; keeps the
+    /// writes on `Ok`, rolls them back on `Err`. Any nested builders
+    /// opened inside `f` must close before `f` returns (the borrow
+    /// checker enforces this).
+    pub fn try_write<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<WriteError>,
+    {
+        if self.w.poisoned {
+            return Err(E::from(WriteError::Poisoned));
+        }
+        let cp = self.w.checkpoint();
+        match f(self) {
+            Ok(v) => {
+                drop(cp);
+                Ok(v)
+            }
+            Err(e) => {
+                if let Err(rb) = self.w.rollback(cp) {
+                    return Err(E::from(rb));
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -190,12 +207,30 @@ impl<S: Sink> Drop for ObjectBuilder<'_, S> {
 }
 
 impl<S: RewindableSink> ObjectBuilder<'_, S> {
-    /// See [`Writer::checkpoint`].
-    pub fn checkpoint(&mut self) -> Checkpoint {
-        self.w.checkpoint()
-    }
-    /// See [`Writer::rollback`].
-    pub fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
-        self.w.rollback(cp)
+    /// See [`Writer::try_write`]. Runs `f` with this builder; keeps the
+    /// writes on `Ok`, rolls them back on `Err`. Any nested builders
+    /// opened inside `f` must close before `f` returns (the borrow
+    /// checker enforces this).
+    pub fn try_write<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<WriteError>,
+    {
+        if self.w.poisoned {
+            return Err(E::from(WriteError::Poisoned));
+        }
+        let cp = self.w.checkpoint();
+        match f(self) {
+            Ok(v) => {
+                drop(cp);
+                Ok(v)
+            }
+            Err(e) => {
+                if let Err(rb) = self.w.rollback(cp) {
+                    return Err(E::from(rb));
+                }
+                Err(e)
+            }
+        }
     }
 }

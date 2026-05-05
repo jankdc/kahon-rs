@@ -1,4 +1,4 @@
-//! Tests for the checkpoint primitives and `snapshot_trailer`.
+//! Tests for `Writer::try_write` and `snapshot_trailer`.
 
 mod common;
 
@@ -33,18 +33,19 @@ fn decode(buf: &[u8]) -> Value {
 }
 
 #[test]
-fn top_level_commit_matches_no_checkpoint_run() {
+fn try_write_ok_matches_no_try_write_run() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
             let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            let cp = w.checkpoint();
-            // Push the eventual root inside the checkpoint; drop cp to keep.
-            let mut a = w.start_array();
-            a.push_i64(1).unwrap();
-            a.push_i64(2).unwrap();
-            a.end().unwrap();
-            drop(cp);
+            w.try_write(|w| -> Result<(), WriteError> {
+                let mut a = w.start_array();
+                a.push_i64(1)?;
+                a.push_i64(2)?;
+                a.end()?;
+                Ok(())
+            })
+            .unwrap();
             w.finish().unwrap();
         }
 
@@ -63,17 +64,18 @@ fn top_level_commit_matches_no_checkpoint_run() {
 }
 
 #[test]
-fn top_level_rollback_discards_writes() {
+fn try_write_err_discards_writes() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
             let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            let cp = w.checkpoint();
-            // Try one variant: an array of strings.
-            let mut a = w.start_array();
-            a.push_str("rejected").unwrap();
-            a.end().unwrap();
-            w.rollback(cp).unwrap();
+            // Try one variant: an array of strings. Force rollback.
+            let _ = w.try_write(|w| -> Result<(), WriteError> {
+                let mut a = w.start_array();
+                a.push_str("rejected")?;
+                a.end()?;
+                Err(WriteError::EmptyDocument)
+            });
             // Try a different variant: a scalar int.
             w.push_i64(42).unwrap();
             w.finish().unwrap();
@@ -92,36 +94,43 @@ fn top_level_rollback_discards_writes() {
 }
 
 #[test]
-fn lexical_nested_inner_rollback_outer_commit() {
-    // Rollback inner discards "rejected"; outer commit keeps the array.
+fn try_write_nested_inner_err_outer_ok() {
+    // Inner try_write returns Err -> "rejected" is undone. Outer
+    // try_write returns Ok -> the array with [1, 2] is kept.
     let mut buf = Vec::new();
     {
         let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
-        let cp_outer = w.checkpoint();
-        let mut a = w.start_array();
-        a.push_i64(1).unwrap();
-        let cp_inner = a.checkpoint();
-        a.push_str("rejected").unwrap();
-        a.rollback(cp_inner).unwrap();
-        a.push_i64(2).unwrap();
-        a.end().unwrap();
-        drop(cp_outer);
+        w.try_write(|w| -> Result<(), WriteError> {
+            let mut a = w.start_array();
+            a.push_i64(1)?;
+            let _ = a.try_write(|a| -> Result<(), WriteError> {
+                a.push_str("rejected")?;
+                Err(WriteError::EmptyDocument)
+            });
+            a.push_i64(2)?;
+            a.end()?;
+            Ok(())
+        })
+        .unwrap();
         w.finish().unwrap();
     }
     assert_eq!(decode(&buf), json!([1, 2]));
 }
 
 #[test]
-fn lexical_nested_outer_rollback_after_inner_drop() {
-    // Drop inner (keep), then outer rollback - everything is undone.
+fn try_write_nested_inner_ok_outer_err_undoes_everything() {
+    // Inner commits a scalar; outer then errors -> the inner's scalar is
+    // undone along with everything else. Recover by pushing a fresh root.
     let mut buf = Vec::new();
     {
         let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
-        let cp_outer = w.checkpoint();
-        let cp_inner = w.checkpoint();
-        w.push_i64(1).unwrap();
-        drop(cp_inner);
-        w.rollback(cp_outer).unwrap();
+        let _ = w.try_write(|w| -> Result<(), WriteError> {
+            w.try_write(|w| -> Result<(), WriteError> {
+                w.push_i64(1)?;
+                Ok(())
+            })?;
+            Err(WriteError::EmptyDocument)
+        });
         w.push_i64(99).unwrap();
         w.finish().unwrap();
     }
@@ -129,9 +138,9 @@ fn lexical_nested_outer_rollback_after_inner_drop() {
 }
 
 #[test]
-fn structural_array_per_element_variants() {
-    // For each element, attempt a "user variant" first (push_str(..)) and on
-    // a fake rejection condition fall back to "guest variant" (push_null).
+fn try_write_array_per_element_variants() {
+    // For each element: try the "user" variant (string) inside a
+    // try_write; on rejection, fall back to the "guest" variant (null).
     let inputs = [Some("alice"), None, Some("bob"), None, Some("carol")];
 
     let mut buf = Vec::new();
@@ -139,21 +148,21 @@ fn structural_array_per_element_variants() {
         let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(3))).unwrap();
         let mut a = w.start_array();
         for input in inputs.iter() {
-            let cp = a.checkpoint();
-            // Try "user" variant (string).
-            a.push_str("speculative").unwrap();
-            if input.is_some() {
-                drop(cp); // keep the speculative push
-            } else {
-                a.rollback(cp).unwrap();
+            let attempted = a.try_write(|a| -> Result<(), WriteError> {
+                a.push_str("speculative")?;
+                if input.is_some() {
+                    Ok(())
+                } else {
+                    Err(WriteError::EmptyDocument) // force rollback
+                }
+            });
+            if attempted.is_err() {
                 a.push_null().unwrap();
             }
         }
         a.end().unwrap();
         w.finish().unwrap();
     }
-    // The "user variant" speculative push was committed verbatim for Some(_)
-    // cases; for None we rolled back and pushed null instead.
     assert_eq!(
         decode(&buf),
         json!(["speculative", null, "speculative", null, "speculative"])
@@ -161,21 +170,23 @@ fn structural_array_per_element_variants() {
 }
 
 #[test]
-fn structural_array_rollback_then_retry() {
-    // Validator pattern: try a value, on err rollback and try a different one.
+fn try_write_array_rollback_then_retry() {
+    // Validator pattern: try variant A, on err rollback and try variant B.
     let mut buf = Vec::new();
     {
         let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
         let mut a = w.start_array();
         for &v in &[1, 2, 3] {
-            let cp = a.checkpoint();
-            // "Variant A": push as string. Pretend it fails for v == 2.
-            a.push_str(&format!("s{v}")).unwrap();
-            if v == 2 {
-                a.rollback(cp).unwrap();
+            let attempted = a.try_write(|a| -> Result<(), WriteError> {
+                a.push_str(&format!("s{v}"))?;
+                if v == 2 {
+                    Err(WriteError::EmptyDocument)
+                } else {
+                    Ok(())
+                }
+            });
+            if attempted.is_err() {
                 a.push_i64(v).unwrap();
-            } else {
-                drop(cp);
             }
         }
         a.end().unwrap();
@@ -184,21 +195,17 @@ fn structural_array_rollback_then_retry() {
     assert_eq!(decode(&buf), json!(["s1", 2, "s3"]));
 }
 
-// -----------------------------------------------------------------------------
-// 5. structural - object
-// -----------------------------------------------------------------------------
-
 #[test]
-fn structural_object_value_variant_with_rollback() {
-    // The value for "role" is a union; first attempt fails, second succeeds.
+fn try_write_object_value_variant_with_rollback() {
     let mut buf = Vec::new();
     {
         let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
         let mut o = w.start_object();
         o.push_str("name", "alice").unwrap();
-        let cp = o.checkpoint();
-        o.push_str("role", "admin").unwrap();
-        o.rollback(cp).unwrap();
+        let _ = o.try_write(|o| -> Result<(), WriteError> {
+            o.push_str("role", "admin")?;
+            Err(WriteError::EmptyDocument)
+        });
         o.push_str("role", "guest").unwrap();
         o.end().unwrap();
         w.finish().unwrap();
@@ -206,12 +213,8 @@ fn structural_object_value_variant_with_rollback() {
     assert_eq!(decode(&buf), json!({"name": "alice", "role": "guest"}));
 }
 
-// -----------------------------------------------------------------------------
-// 6. mixed nesting (object containing array of variants)
-// -----------------------------------------------------------------------------
-
 #[test]
-fn mixed_nesting_object_with_variant_array() {
+fn try_write_mixed_nesting_object_with_variant_array() {
     let mut buf = Vec::new();
     {
         let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
@@ -220,13 +223,14 @@ fn mixed_nesting_object_with_variant_array() {
         {
             let mut tags = o.start_array("tags").unwrap();
             for tag in &["red", "skip", "blue"] {
-                let cp = tags.checkpoint();
-                tags.push_str(tag).unwrap();
-                if *tag == "skip" {
-                    tags.rollback(cp).unwrap();
-                } else {
-                    drop(cp);
-                }
+                let _ = tags.try_write(|t| -> Result<(), WriteError> {
+                    t.push_str(tag)?;
+                    if *tag == "skip" {
+                        Err(WriteError::EmptyDocument)
+                    } else {
+                        Ok(())
+                    }
+                });
             }
             tags.end().unwrap();
         }
@@ -239,210 +243,8 @@ fn mixed_nesting_object_with_variant_array() {
     );
 }
 
-// -----------------------------------------------------------------------------
-// 7. depth-mismatch rejection
-// -----------------------------------------------------------------------------
-
 #[test]
-fn rollback_at_wrong_depth_is_rejected() {
-    let mut buf = Vec::new();
-    let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(128))).unwrap();
-    let mut o = w.start_object();
-    let cp = o.checkpoint(); // depth = 1 (object frame open)
-    o.push_str("name", "alice").unwrap();
-    let mut tags = o.start_array("tags").unwrap(); // depth = 2
-    tags.push_str("a").unwrap();
-    // Try to rollback the object-level cp from inside the array.
-    let err = tags.rollback(cp).unwrap_err();
-    assert!(matches!(err, WriteError::InvalidCheckpoint));
-}
-
-// -----------------------------------------------------------------------------
-// 8. position-mismatch rejection (already-rolled-back cp re-used)
-// -----------------------------------------------------------------------------
-
-#[test]
-fn reusing_rolled_back_checkpoint_is_rejected() {
-    // Take cp1, push, take cp2, push more, rollback to cp1 (sink shrinks
-    // past cp2.pos), attempt to use cp2 - its position is now past EOF.
-    let mut buf = Vec::new();
-    let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(128))).unwrap();
-    let mut a = w.start_array();
-    a.push_i64(1).unwrap();
-    let cp1 = a.checkpoint();
-    a.push_i64(2).unwrap();
-    let cp2 = a.checkpoint();
-    a.push_i64(3).unwrap();
-    a.rollback(cp1).unwrap();
-    let err = a.rollback(cp2).unwrap_err();
-    assert!(matches!(err, WriteError::InvalidCheckpoint));
-}
-
-// -----------------------------------------------------------------------------
-// 9. drop without resolve = implicit commit
-// -----------------------------------------------------------------------------
-
-#[test]
-fn dropped_checkpoint_is_implicit_commit() {
-    let mut buf_drop = Vec::new();
-    {
-        let mut w = Writer::with_options(&mut buf_drop, opts(BuildPolicy::compact(128))).unwrap();
-        let _cp = w.checkpoint();
-        w.push_i64(7).unwrap();
-        // _cp drops at end of statement scope; no commit/rollback called.
-        w.finish().unwrap();
-    }
-
-    let mut buf_no = Vec::new();
-    {
-        let mut w = Writer::with_options(&mut buf_no, opts(BuildPolicy::compact(128))).unwrap();
-        w.push_i64(7).unwrap();
-        w.finish().unwrap();
-    }
-
-    assert_eq!(buf_drop, buf_no);
-}
-
-// -----------------------------------------------------------------------------
-// 11. snapshot_trailer produces a valid kahon document
-// -----------------------------------------------------------------------------
-
-#[test]
-fn snapshot_trailer_yields_valid_document() {
-    for (name, policy) in policies() {
-        // Build a partial document: an array with two elements pushed.
-        // Snapshot mid-stream, assemble prefix + tail, decode.
-        let mut buf = Vec::new();
-        let snapshot = {
-            let mut w = Writer::with_options(&mut buf, opts(policy.clone())).unwrap();
-            let mut a = w.start_array();
-            a.push_i64(10).unwrap();
-            a.push_str("hello").unwrap();
-            // snapshot_trailer is on Writer; need to drop the builder first.
-            // Use the borrow trick: end the array here and re-take checkpoints
-            // is not the goal. Instead, the test exercises snapshot_trailer
-            // with no open frames - see also `snapshot_with_open_frames`.
-            a.end().unwrap();
-            w.snapshot_trailer().unwrap()
-        };
-
-        let mut composed = buf[..snapshot.prefix_len as usize].to_vec();
-        composed.extend_from_slice(&snapshot.bytes);
-        let value = decode(&composed);
-        assert_eq!(value, json!([10, "hello"]), "policy={name}");
-    }
-}
-
-#[test]
-fn snapshot_accessors_match_assembled_doc() {
-    // total_len, root_offset, and trailer_offset must agree with what a
-    // reader would compute from the assembled bytes.
-    let mut buf = Vec::new();
-    let snap = {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(128))).unwrap();
-        let mut a = w.start_array();
-        a.push_i64(7).unwrap();
-        a.push_str("hi").unwrap();
-        a.end().unwrap();
-        w.snapshot_trailer().unwrap()
-    };
-
-    let mut composed = buf[..snap.prefix_len as usize].to_vec();
-    composed.extend_from_slice(&snap.bytes);
-
-    // total_len = composed.len()
-    assert_eq!(snap.total_len() as usize, composed.len());
-
-    // trailer_offset = total_len - 12 (spec §10.2)
-    assert_eq!(snap.trailer_offset(), snap.total_len() - 12);
-
-    // root_offset matches the u64 stored at the trailer's first 8 bytes.
-    let trailer_start = snap.trailer_offset() as usize;
-    let stored_root = u64::from_le_bytes(
-        composed[trailer_start..trailer_start + 8]
-            .try_into()
-            .unwrap(),
-    );
-    assert_eq!(snap.root_offset(), stored_root);
-
-    // And the byte at root_offset is a valid container type-code (an array
-    // tag in this case: 0x70..=0x77).
-    let tag = composed[snap.root_offset() as usize];
-    assert!(
-        (0x70..=0x77).contains(&tag),
-        "expected array tag at root, got {tag:#x}"
-    );
-}
-
-#[test]
-fn snapshot_with_unfinalized_run_still_valid() {
-    // Use a small fanout so the B+tree cascade is not a single leaf -
-    // snapshot must close the cascade correctly into the side buffer.
-    // The borrow checker prevents calling snapshot_trailer while a
-    // builder is alive, so we close the array first; the cascade-close
-    // path is still exercised by snapshot via its frame clone (the
-    // post-close root is unchanged regardless).
-    let mut buf = Vec::new();
-    let snap = {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(2))).unwrap();
-        {
-            let mut a = w.start_array();
-            for i in 0..5 {
-                a.push_i64(i).unwrap();
-            }
-            a.end().unwrap();
-        }
-        w.snapshot_trailer().unwrap()
-    };
-    let mut composed = buf[..snap.prefix_len as usize].to_vec();
-    composed.extend_from_slice(&snap.bytes);
-    assert_eq!(decode(&composed), json!([0, 1, 2, 3, 4]));
-}
-
-// -----------------------------------------------------------------------------
-// 12. snapshot_trailer is non-destructive
-// -----------------------------------------------------------------------------
-
-#[test]
-fn snapshot_trailer_is_non_destructive() {
-    // Snapshot mid-stream, then keep writing; the final document must be
-    // byte-identical to a control run that never called snapshot_trailer.
-    for (name, policy) in policies() {
-        let mut buf_with = Vec::new();
-        {
-            let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            let mut a = w.start_array();
-            a.push_i64(1).unwrap();
-            a.push_i64(2).unwrap();
-            a.end().unwrap();
-            // Snapshot here; live writer should be unaffected.
-            let _snap = w.snapshot_trailer().unwrap();
-            w.finish().unwrap();
-        }
-
-        let mut buf_no = Vec::new();
-        {
-            let mut w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
-            let mut a = w.start_array();
-            a.push_i64(1).unwrap();
-            a.push_i64(2).unwrap();
-            a.end().unwrap();
-            w.finish().unwrap();
-        }
-
-        assert_eq!(buf_with, buf_no, "policy={name}");
-    }
-}
-
-// -----------------------------------------------------------------------------
-// 10. parametrized: rollback under all BuildPolicy settings
-// -----------------------------------------------------------------------------
-
-#[test]
-fn rollback_under_all_policies_matches_control() {
-    // Comprehensive rollback test parametrized over policies.
-    // Build with: push committed prefix, take cp, push junk, rollback,
-    // push committed suffix. Compare to a control with no junk.
+fn try_write_rollback_under_all_policies_matches_control() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
@@ -451,11 +253,12 @@ fn rollback_under_all_policies_matches_control() {
             for i in 0..6 {
                 o.push_i64(&format!("k{i}"), i as i64).unwrap();
             }
-            let cp = o.checkpoint();
-            for i in 100..106 {
-                o.push_i64(&format!("junk{i}"), i as i64).unwrap();
-            }
-            o.rollback(cp).unwrap();
+            let _ = o.try_write(|o| -> Result<(), WriteError> {
+                for i in 100..106 {
+                    o.push_i64(&format!("junk{i}"), i as i64)?;
+                }
+                Err(WriteError::EmptyDocument)
+            });
             for i in 6..10 {
                 o.push_i64(&format!("k{i}"), i as i64).unwrap();
             }
@@ -474,24 +277,21 @@ fn rollback_under_all_policies_matches_control() {
             w.finish().unwrap();
         }
 
-        // Both decode to the same logical value. They may not be byte-identical
-        // because the rollback doesn't recover scratch capacities or other
-        // non-observable state, but the encoded bytes should match.
+        // Same logical value; not necessarily byte-identical (rollback
+        // doesn't recover scratch capacities or other non-observable state).
         assert_eq!(decode(&buf_with), decode(&buf_no), "policy={name}");
     }
 }
 
-// -----------------------------------------------------------------------------
-// poison + checkpoint interaction
-// -----------------------------------------------------------------------------
-
 #[test]
-fn rollback_on_poisoned_writer_errors() {
+fn try_write_recovers_from_poison() {
+    // A failure inside the closure may poison the writer (e.g., a
+    // builder's Drop close emits to a sink that errors). The try_write
+    // rolls back to the entry state, including clearing the poison flag,
+    // and propagates the user's Err.
     use kahon::{RewindableSink, Sink};
     use std::io;
 
-    // Custom sink that fails after N bytes, used to drive the writer into
-    // a poisoned state via a failed builder Drop.
     struct FailAfter {
         buf: Vec<u8>,
         budget: usize,
@@ -518,19 +318,156 @@ fn rollback_on_poisoned_writer_errors() {
         budget: 8, // header (6) + a couple bytes; close will fail.
     };
     let mut w = Writer::with_options(sink, opts(BuildPolicy::compact(128))).unwrap();
-    let cp = w.checkpoint();
-    {
+    let outcome = w.try_write(|w| -> Result<(), WriteError> {
         let mut a = w.start_array();
-        // Push enough to exceed budget when the array closes.
         for _ in 0..16 {
             let _ = a.push_i64(1);
         }
-        // Drop closes the array; the close write exceeds budget, poisoning
-        // the writer.
+        // a's Drop will fail to flush; that poisons the writer. The
+        // closure still has to return some Err (or Ok) - we choose Err
+        // explicitly so try_write takes the rollback branch.
+        Err(WriteError::Io(io::Error::other("drop will fail")))
+    });
+    assert!(outcome.is_err());
+    // After rollback, position is restored to post-header and poison is
+    // cleared - the writer is fundamentally usable again.
+    assert_eq!(w.bytes_written(), 6, "position restored to post-header");
+}
+
+#[test]
+fn try_write_rejects_already_poisoned_writer() {
+    // Once the writer is poisoned outside a try_write call, subsequent
+    // try_write attempts must fail fast with Poisoned - they do not run
+    // the closure, do not take a checkpoint, and do not silently recover.
+    use kahon::{RewindableSink, Sink};
+    use std::io;
+
+    struct AlwaysFails;
+    impl Sink for AlwaysFails {
+        fn write_all(&mut self, _: &[u8]) -> io::Result<()> {
+            Err(io::Error::other("nope"))
+        }
     }
-    let err = w.rollback(cp).unwrap_err();
+    impl RewindableSink for AlwaysFails {
+        fn rewind_to(&mut self, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Construct a writer; the header write fails and poisons it.
+    let mut w = Writer::with_options(AlwaysFails, opts(BuildPolicy::compact(128))).unwrap();
+    // Confirm precondition: writer is poisoned.
+    assert!(matches!(w.push_i64(1), Err(WriteError::Poisoned)));
+
+    // try_write must refuse, returning Poisoned without invoking the closure.
+    let mut closure_ran = false;
+    let outcome: Result<(), WriteError> = w.try_write(|_w| {
+        closure_ran = true;
+        Ok(())
+    });
+    assert!(matches!(outcome, Err(WriteError::Poisoned)));
     assert!(
-        matches!(err, WriteError::Poisoned),
-        "expected Poisoned, got {err:?}"
+        !closure_ran,
+        "try_write must not run f on a poisoned writer"
     );
+}
+
+#[test]
+fn snapshot_trailer_yields_valid_document() {
+    for (name, policy) in policies() {
+        let mut buf = Vec::new();
+        let snapshot = {
+            let mut w = Writer::with_options(&mut buf, opts(policy.clone())).unwrap();
+            let mut a = w.start_array();
+            a.push_i64(10).unwrap();
+            a.push_str("hello").unwrap();
+            a.end().unwrap();
+            w.snapshot_trailer().unwrap()
+        };
+
+        let mut composed = buf[..snapshot.prefix_len as usize].to_vec();
+        composed.extend_from_slice(&snapshot.bytes);
+        let value = decode(&composed);
+        assert_eq!(value, json!([10, "hello"]), "policy={name}");
+    }
+}
+
+#[test]
+fn snapshot_accessors_match_assembled_doc() {
+    let mut buf = Vec::new();
+    let snap = {
+        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(128))).unwrap();
+        let mut a = w.start_array();
+        a.push_i64(7).unwrap();
+        a.push_str("hi").unwrap();
+        a.end().unwrap();
+        w.snapshot_trailer().unwrap()
+    };
+
+    let mut composed = buf[..snap.prefix_len as usize].to_vec();
+    composed.extend_from_slice(&snap.bytes);
+
+    assert_eq!(snap.total_len() as usize, composed.len());
+    assert_eq!(snap.trailer_offset(), snap.total_len() - 12);
+
+    let trailer_start = snap.trailer_offset() as usize;
+    let stored_root = u64::from_le_bytes(
+        composed[trailer_start..trailer_start + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(snap.root_offset(), stored_root);
+
+    let tag = composed[snap.root_offset() as usize];
+    assert!(
+        (0x70..=0x77).contains(&tag),
+        "expected array tag at root, got {tag:#x}"
+    );
+}
+
+#[test]
+fn snapshot_with_unfinalized_run_still_valid() {
+    let mut buf = Vec::new();
+    let snap = {
+        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(2))).unwrap();
+        {
+            let mut a = w.start_array();
+            for i in 0..5 {
+                a.push_i64(i).unwrap();
+            }
+            a.end().unwrap();
+        }
+        w.snapshot_trailer().unwrap()
+    };
+    let mut composed = buf[..snap.prefix_len as usize].to_vec();
+    composed.extend_from_slice(&snap.bytes);
+    assert_eq!(decode(&composed), json!([0, 1, 2, 3, 4]));
+}
+
+#[test]
+fn snapshot_trailer_is_non_destructive() {
+    for (name, policy) in policies() {
+        let mut buf_with = Vec::new();
+        {
+            let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
+            let mut a = w.start_array();
+            a.push_i64(1).unwrap();
+            a.push_i64(2).unwrap();
+            a.end().unwrap();
+            let _snap = w.snapshot_trailer().unwrap();
+            w.finish().unwrap();
+        }
+
+        let mut buf_no = Vec::new();
+        {
+            let mut w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
+            let mut a = w.start_array();
+            a.push_i64(1).unwrap();
+            a.push_i64(2).unwrap();
+            a.end().unwrap();
+            w.finish().unwrap();
+        }
+
+        assert_eq!(buf_with, buf_no, "policy={name}");
+    }
 }

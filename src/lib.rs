@@ -120,7 +120,7 @@ mod types;
 mod writer;
 
 pub use builder::{ArrayBuilder, ObjectBuilder};
-pub use checkpoint::{Checkpoint, TrailerSnapshot};
+pub use checkpoint::TrailerSnapshot;
 pub use config::{BuildPolicy, NodeSizing, PageAlignment, WriterOptions};
 pub use error::WriteError;
 pub use sink::{RewindableSink, Sink};
