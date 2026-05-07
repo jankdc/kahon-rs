@@ -161,6 +161,9 @@ impl<S: Sink> RawWriter<S> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
         }
+        if self.frames.is_empty() && self.root_offset.is_some() {
+            return Err(WriteError::MultipleRootValues);
+        }
         self.push_array_frame();
         Ok(())
     }
@@ -184,6 +187,9 @@ impl<S: Sink> RawWriter<S> {
     pub fn begin_object(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
+        }
+        if self.frames.is_empty() && self.root_offset.is_some() {
+            return Err(WriteError::MultipleRootValues);
         }
         self.push_object_frame();
         Ok(())
