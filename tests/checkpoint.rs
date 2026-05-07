@@ -1,7 +1,6 @@
 mod common;
 
 use common::reader;
-use kahon::raw::RawWriter;
 use kahon::{BuildPolicy, NodeSizing, PageAlignment, WriteError, Writer, WriterOptions};
 use serde_json::{json, Value};
 
@@ -36,16 +35,16 @@ fn try_write_ok_matches_no_try_write_run() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
-            let mut r = RawWriter::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            r.try_write(|r| -> Result<(), WriteError> {
-                r.begin_array()?;
-                r.push_i64(1)?;
-                r.push_i64(2)?;
-                r.end_array()?;
+            let w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
+            let mut a = w.start_array();
+            a.try_write(|a| -> Result<(), WriteError> {
+                a.push_i64(1)?;
+                a.push_i64(2)?;
                 Ok(())
             })
             .unwrap();
-            r.finish().unwrap();
+            let w = a.end().unwrap();
+            w.finish().unwrap();
         }
 
         let mut buf_no = Vec::new();
@@ -67,51 +66,53 @@ fn try_write_err_discards_writes() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
-            let mut r = RawWriter::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            // Try one variant: an array of strings. Force rollback.
-            let _ = r.try_write(|r| -> Result<(), WriteError> {
-                r.begin_array()?;
-                r.push_str("rejected")?;
-                r.end_array()?;
+            let w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
+            let mut a = w.start_array();
+            // Try one variant: push a string. Force rollback.
+            let _ = a.try_write(|a| -> Result<(), WriteError> {
+                a.push_str("rejected")?;
                 Err(WriteError::EmptyDocument)
             });
             // Try a different variant: a scalar int.
-            r.push_i64(42).unwrap();
-            r.finish().unwrap();
+            a.push_i64(42).unwrap();
+            let w = a.end().unwrap();
+            w.finish().unwrap();
         }
 
         let mut buf_no = Vec::new();
         {
             let w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
-            let w = w.push_i64(42).unwrap();
+            let mut a = w.start_array();
+            a.push_i64(42).unwrap();
+            let w = a.end().unwrap();
             w.finish().unwrap();
         }
 
         assert_eq!(buf_with, buf_no, "policy={name}");
-        assert_eq!(decode(&buf_with), json!(42));
+        assert_eq!(decode(&buf_with), json!([42]));
     }
 }
 
 #[test]
 fn try_write_nested_inner_err_outer_ok() {
     // Inner try_write returns Err -> "rejected" is undone. Outer
-    // try_write returns Ok -> the array with [1, 2] is kept.
+    // try_write returns Ok -> [1, 2] is kept.
     let mut buf = Vec::new();
     {
-        let mut r = RawWriter::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
-        r.try_write(|r| -> Result<(), WriteError> {
-            r.begin_array()?;
-            r.push_i64(1)?;
-            let _ = r.try_write(|r| -> Result<(), WriteError> {
-                r.push_str("rejected")?;
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
+        let mut a = w.start_array();
+        a.try_write(|a| -> Result<(), WriteError> {
+            a.push_i64(1)?;
+            let _ = a.try_write(|a| -> Result<(), WriteError> {
+                a.push_str("rejected")?;
                 Err(WriteError::EmptyDocument)
             });
-            r.push_i64(2)?;
-            r.end_array()?;
+            a.push_i64(2)?;
             Ok(())
         })
         .unwrap();
-        r.finish().unwrap();
+        let w = a.end().unwrap();
+        w.finish().unwrap();
     }
     assert_eq!(decode(&buf), json!([1, 2]));
 }
@@ -119,21 +120,23 @@ fn try_write_nested_inner_err_outer_ok() {
 #[test]
 fn try_write_nested_inner_ok_outer_err_undoes_everything() {
     // Inner commits a scalar; outer then errors -> the inner's scalar is
-    // undone along with everything else. Recover by pushing a fresh root.
+    // undone along with everything else. Recover by pushing a fresh value.
     let mut buf = Vec::new();
     {
-        let mut r = RawWriter::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
-        let _ = r.try_write(|r| -> Result<(), WriteError> {
-            r.try_write(|r| -> Result<(), WriteError> {
-                r.push_i64(1)?;
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
+        let mut a = w.start_array();
+        let _ = a.try_write(|a| -> Result<(), WriteError> {
+            a.try_write(|a| -> Result<(), WriteError> {
+                a.push_i64(1)?;
                 Ok(())
             })?;
             Err(WriteError::EmptyDocument)
         });
-        r.push_i64(99).unwrap();
-        r.finish().unwrap();
+        a.push_i64(99).unwrap();
+        let w = a.end().unwrap();
+        w.finish().unwrap();
     }
-    assert_eq!(decode(&buf), json!(99));
+    assert_eq!(decode(&buf), json!([99]));
 }
 
 #[test]
@@ -314,22 +317,23 @@ fn try_write_recovers_from_poison() {
 
     let sink = FailAfter {
         buf: Vec::new(),
-        budget: 8, // header (6) + a couple bytes; close will fail.
+        budget: 8, // header (6) + a couple bytes; further writes will fail.
     };
-    let mut r = RawWriter::with_options(sink, opts(BuildPolicy::compact(128))).unwrap();
-    let outcome = r.try_write(|r| -> Result<(), WriteError> {
-        r.begin_array()?;
+    let w = Writer::with_options(sink, opts(BuildPolicy::compact(128))).unwrap();
+    let mut a = w.start_array();
+    let entry = a.bytes_written();
+    let outcome = a.try_write(|a| -> Result<(), WriteError> {
         for _ in 0..16 {
-            let _ = r.push_i64(1);
+            let _ = a.push_i64(1);
         }
-        // The close will fail and poison the writer mid-closure; we
-        // return an explicit Err so try_write takes the rollback branch.
+        // Writes have likely poisoned the writer mid-closure; we return
+        // an explicit Err so try_write takes the rollback branch.
         Err(WriteError::Io(io::Error::other("forced rollback")))
     });
     assert!(outcome.is_err());
-    // After rollback, position is restored to post-header and poison is
-    // cleared - the writer is fundamentally usable again.
-    assert_eq!(r.bytes_written(), 6, "position restored to post-header");
+    // After rollback, position is restored to the try_write entry point
+    // and poison is cleared - the builder is fundamentally usable again.
+    assert_eq!(a.bytes_written(), entry, "position restored to entry");
 }
 
 #[test]
@@ -353,13 +357,14 @@ fn try_write_rejects_already_poisoned_writer() {
     }
 
     // Construct a writer; the header write fails and poisons it.
-    let mut r = RawWriter::with_options(AlwaysFails, opts(BuildPolicy::compact(128))).unwrap();
+    let w = Writer::with_options(AlwaysFails, opts(BuildPolicy::compact(128))).unwrap();
+    let mut a = w.start_array();
     // Confirm precondition: writer is poisoned.
-    assert!(matches!(r.push_i64(1), Err(WriteError::Poisoned)));
+    assert!(matches!(a.push_i64(1), Err(WriteError::Poisoned)));
 
     // try_write must refuse, returning Poisoned without invoking the closure.
     let mut closure_ran = false;
-    let outcome: Result<(), WriteError> = r.try_write(|_r| {
+    let outcome: Result<(), WriteError> = a.try_write(|_a| {
         closure_ran = true;
         Ok(())
     });
