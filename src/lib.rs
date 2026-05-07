@@ -1,11 +1,9 @@
-//! A streaming writer for the [Kahon binary format].
+//! Streaming writer for the [Kahon binary format] - a JSON-shaped
+//! container with random-access B+tree arrays and objects.
 //!
-//! Kahon is a JSON-shaped binary container designed for random access:
-//! arrays and objects are laid out as on-disk B+trees, so a reader can
-//! index into a million-element array or look up a key in a million-key
-//! object without scanning the document. Values are written as they
-//! arrive and containers reference children by back-offset, so writer
-//! memory stays bounded by tree depth, not document size.
+//! Writer memory stays bounded by tree depth, not document size, so
+//! arbitrarily large documents stream through without buffering the
+//! whole thing.
 //!
 //! [Kahon binary format]: https://github.com/jankdc/kahon
 //!
@@ -16,96 +14,82 @@
 //!
 //! # fn main() -> Result<(), kahon::WriteError> {
 //! let mut buf: Vec<u8> = Vec::new();
-//! let mut w = Writer::new(&mut buf);
+//!
+//! let mut monster = Writer::new(&mut buf).start_object();
+//! monster.push_i64("hp", 80)?;
+//! monster.push_bool("enraged", true)?;
 //!
 //! {
-//!     let mut monster = w.start_object();
-//!     monster.push_i64("hp", 80)?;
-//!     monster.push_bool("enraged", true)?;
+//!     let mut weapons = monster.start_array("weapons")?;
+//!     weapons.push_str("fist")?;
 //!
-//!     {
-//!         let mut weapons = monster.start_array("weapons")?;
-//!         weapons.push_str("fist")?;
-//!
-//!         let mut axe = weapons.start_object();
-//!         axe.push_str("name", "great axe")?;
-//!         axe.push_i64("damage", 15)?;
-//!         // `axe` and `weapons` auto-close on drop.
-//!     }
-//!
-//!     monster.end()?; // explicit close surfaces errors
+//!     let mut axe = weapons.start_object();
+//!     axe.push_str("name", "great axe")?;
+//!     axe.push_i64("damage", 15)?;
+//!     // nested builders auto-close on drop
 //! }
 //!
-//! w.finish()?; // writes the 12-byte trailer
+//! monster.end()?.finish()?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # Building a document
 //!
-//! Construction follows a flexbuffer-style builder pattern. Start at a
-//! [`Writer`], push exactly one root value (scalar, array, or object),
-//! then call [`Writer::finish`] to emit the trailer.
+//! A [`Writer`] holds exactly one root value: push a scalar, or open
+//! the root with [`start_array`](Writer::start_array) /
+//! [`start_object`](Writer::start_object) to get a
+//! [`RootArrayBuilder`] / [`RootObjectBuilder`]. Inside a container,
+//! [`ArrayBuilder`] / [`ObjectBuilder`] let you append more scalars and
+//! open nested containers. Object methods take the key positionally
+//! (`obj.push_i64("hp", 80)`); duplicate keys resolve last-wins.
 //!
-//! - Scalars are pushed via `push_null`, `push_bool`, `push_i64`,
-//!   `push_u64`, `push_f64`, `push_str`.
-//! - Arrays and objects are opened with `start_array` / `start_object`,
-//!   which return an [`ArrayBuilder`] or [`ObjectBuilder`]. Builders
-//!   borrow their parent mutably and may be nested freely.
-//! - Object keys are passed positionally before the value
-//!   (`obj.push_i64("hp", 80)`). Duplicate keys within an object's
-//!   sort window resolve last-wins (the latest push for a given key
-//!   replaces earlier ones).
+//! Finish the document by calling [`.end()`](RootObjectBuilder::end) on
+//! the root builder, then [`.finish()`](Writer::finish) on the writer
+//! it returns. The compiler enforces exactly-one-root and rejects
+//! `finish` before a root is written.
 //!
 //! # Closing builders: `Drop` vs `end`
 //!
-//! Builders close their container on `Drop`, which is convenient for the
-//! happy path. If the close encounters a write error, however, `Drop`
-//! has nowhere to surface it - the writer is poisoned and the error is
-//! reported on the next operation (or on [`Writer::finish`]).
+//! Nested [`ArrayBuilder`] / [`ObjectBuilder`] close on drop - handy on
+//! the happy path, but a close error has nowhere to go and poisons the
+//! writer instead. Call `.end()?` to surface that error as a `Result`.
 //!
-//! Call [`ArrayBuilder::end`] or [`ObjectBuilder::end`] to close
-//! explicitly and propagate errors as a `Result`.
+//! Root builders ([`RootArrayBuilder`], [`RootObjectBuilder`]) are
+//! `#[must_use]`: dropping one without `.end()` leaves the document
+//! without a trailer.
 //!
 //! # Tuning the layout
-//!
-//! [`WriterOptions`] selects how B+tree nodes are sized and whether the
-//! body is padded for page-cache friendliness:
 //!
 //! ```
 //! use kahon::{BuildPolicy, Writer, WriterOptions};
 //!
 //! # fn main() -> Result<(), kahon::WriteError> {
 //! # let mut sink: Vec<u8> = Vec::new();
-//! // Disk-tuned: each B+tree node targets one page, trailer is page-aligned.
 //! let opts = WriterOptions {
 //!     policy: BuildPolicy::disk_aligned(4096),
 //!     ..Default::default()
 //! };
 //! let w = Writer::with_options(&mut sink, opts)?;
-//! # let _ = w;
+//! # let _ = w.push_null()?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The default ([`BuildPolicy::compact`] with fanout 128) produces the
-//! tightest output and is best for in-memory or network use.
-//! [`BuildPolicy::disk_aligned`] trades a small amount of unreferenced
-//! padding for a layout that plays well with the page cache when files
-//! are `pread`-ed or memory-mapped.
+//! The default produces the tightest output and suits in-memory or
+//! network use. [`BuildPolicy::disk_aligned`] adds a small amount of
+//! padding for a layout friendlier to `pread` / `mmap`.
 //!
 //! # Sinks
 //!
-//! Any type implementing [`std::io::Write`] is also a [`Sink`] via a
-//! blanket impl, so you can write to a `Vec<u8>`, a `File`, a
-//! `BufWriter`, or any other writer without adapters.
+//! Any [`std::io::Write`] is a [`Sink`] - `Vec<u8>`, `File`,
+//! `BufWriter`, etc. all work without adapters.
 //!
 //! # Errors
 //!
-//! All fallible operations return [`WriteError`]. Once an error occurs
-//! mid-document the writer is *poisoned*: subsequent operations fail
-//! fast with [`WriteError::Poisoned`] rather than producing a malformed
-//! file.
+//! Fallible operations return [`WriteError`]. After any error mid-
+//! document, the writer is *poisoned* and further calls fail fast with
+//! [`WriteError::Poisoned`] instead of producing a malformed file.
 
 mod align;
 mod bplus;
@@ -115,16 +99,26 @@ mod config;
 mod encode;
 mod error;
 mod frame;
+mod raw_writer;
 mod sink;
+mod trailer;
 mod types;
 mod writer;
 
-pub use builder::{ArrayBuilder, ObjectBuilder};
-pub use checkpoint::TrailerSnapshot;
+/// Flat, runtime-checked writer surface for advanced integrations
+/// (FFI bridges, async stream parsers, storage adapters). Most users
+/// want [`Writer`] and its builders.
+pub mod raw {
+    pub use crate::checkpoint::Checkpoint;
+    pub use crate::raw_writer::RawWriter;
+}
+
+pub use builder::{ArrayBuilder, ObjectBuilder, RootArrayBuilder, RootObjectBuilder};
 pub use config::{BuildPolicy, NodeSizing, PageAlignment, WriterOptions};
 pub use error::WriteError;
 pub use sink::{RewindableSink, Sink};
-pub use writer::Writer;
+pub use trailer::TrailerSnapshot;
+pub use writer::{Empty, Filled, Writer};
 
 /// Convenience alias for `std::result::Result<T, WriteError>`.
 pub type Result<T> = std::result::Result<T, WriteError>;

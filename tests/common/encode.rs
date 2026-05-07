@@ -1,28 +1,31 @@
 //! Shared helpers for encoding-shape tests: drive a `Writer`, then peek at
 //! header/trailer/root to make assertions about emitted bytes.
 
-use kahon::{BuildPolicy, Writer, WriterOptions};
+use kahon::{BuildPolicy, Empty, Filled, Writer, WriterOptions};
 
 /// Header is 6 bytes; trailer is 12 bytes (root_offset u64 + magic u32).
 const HEADER_LEN: usize = 6;
 const TRAILER_LEN: usize = 12;
 
-/// Build a document by driving a fresh `Writer`. Panics on encode error so
+/// Build a document by driving a fresh `Writer`. The closure receives a
+/// writer in the `Empty` state and must return the (same) writer in the
+/// `Filled` state - i.e. with a root pushed. Panics on encode error so
 /// individual tests stay focused on the assertion, not the plumbing.
 ///
 /// Uses the compact (fanout=128, no padding) policy so byte-level tests can
 /// reason about exact body bytes without accounting for page-alignment fill.
-pub fn build<F: FnOnce(&mut Writer<&mut Vec<u8>>)>(f: F) -> Vec<u8> {
+pub fn build<F>(f: F) -> Vec<u8>
+where
+    F: for<'a> FnOnce(Writer<&'a mut Vec<u8>, Empty>) -> Writer<&'a mut Vec<u8>, Filled>,
+{
     let opts = WriterOptions {
         policy: BuildPolicy::compact(128),
         ..WriterOptions::default()
     };
-    let mut buf = Vec::new();
-    {
-        let mut w = Writer::with_options(&mut buf, opts).unwrap();
-        f(&mut w);
-        w.finish().unwrap();
-    }
+    let mut buf: Vec<u8> = Vec::new();
+    let w = Writer::with_options(&mut buf, opts).unwrap();
+    let w = f(w);
+    w.finish().unwrap();
     buf
 }
 

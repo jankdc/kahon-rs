@@ -1,5 +1,3 @@
-//! Tests for `Writer::try_write` and `snapshot_trailer`.
-
 mod common;
 
 use common::reader;
@@ -37,25 +35,25 @@ fn try_write_ok_matches_no_try_write_run() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
-            let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            w.try_write(|w| -> Result<(), WriteError> {
-                let mut a = w.start_array();
+            let w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
+            let mut a = w.start_array();
+            a.try_write(|a| -> Result<(), WriteError> {
                 a.push_i64(1)?;
                 a.push_i64(2)?;
-                a.end()?;
                 Ok(())
             })
             .unwrap();
+            let w = a.end().unwrap();
             w.finish().unwrap();
         }
 
         let mut buf_no = Vec::new();
         {
-            let mut w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
+            let w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
             let mut a = w.start_array();
             a.push_i64(1).unwrap();
             a.push_i64(2).unwrap();
-            a.end().unwrap();
+            let w = a.end().unwrap();
             w.finish().unwrap();
         }
 
@@ -68,50 +66,52 @@ fn try_write_err_discards_writes() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
-            let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            // Try one variant: an array of strings. Force rollback.
-            let _ = w.try_write(|w| -> Result<(), WriteError> {
-                let mut a = w.start_array();
+            let w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
+            let mut a = w.start_array();
+            // Try one variant: push a string. Force rollback.
+            let _ = a.try_write(|a| -> Result<(), WriteError> {
                 a.push_str("rejected")?;
-                a.end()?;
                 Err(WriteError::EmptyDocument)
             });
             // Try a different variant: a scalar int.
-            w.push_i64(42).unwrap();
+            a.push_i64(42).unwrap();
+            let w = a.end().unwrap();
             w.finish().unwrap();
         }
 
         let mut buf_no = Vec::new();
         {
-            let mut w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
-            w.push_i64(42).unwrap();
+            let w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
+            let mut a = w.start_array();
+            a.push_i64(42).unwrap();
+            let w = a.end().unwrap();
             w.finish().unwrap();
         }
 
         assert_eq!(buf_with, buf_no, "policy={name}");
-        assert_eq!(decode(&buf_with), json!(42));
+        assert_eq!(decode(&buf_with), json!([42]));
     }
 }
 
 #[test]
 fn try_write_nested_inner_err_outer_ok() {
     // Inner try_write returns Err -> "rejected" is undone. Outer
-    // try_write returns Ok -> the array with [1, 2] is kept.
+    // try_write returns Ok -> [1, 2] is kept.
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
-        w.try_write(|w| -> Result<(), WriteError> {
-            let mut a = w.start_array();
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
+        let mut a = w.start_array();
+        a.try_write(|a| -> Result<(), WriteError> {
             a.push_i64(1)?;
             let _ = a.try_write(|a| -> Result<(), WriteError> {
                 a.push_str("rejected")?;
                 Err(WriteError::EmptyDocument)
             });
             a.push_i64(2)?;
-            a.end()?;
             Ok(())
         })
         .unwrap();
+        let w = a.end().unwrap();
         w.finish().unwrap();
     }
     assert_eq!(decode(&buf), json!([1, 2]));
@@ -120,21 +120,23 @@ fn try_write_nested_inner_err_outer_ok() {
 #[test]
 fn try_write_nested_inner_ok_outer_err_undoes_everything() {
     // Inner commits a scalar; outer then errors -> the inner's scalar is
-    // undone along with everything else. Recover by pushing a fresh root.
+    // undone along with everything else. Recover by pushing a fresh value.
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
-        let _ = w.try_write(|w| -> Result<(), WriteError> {
-            w.try_write(|w| -> Result<(), WriteError> {
-                w.push_i64(1)?;
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
+        let mut a = w.start_array();
+        let _ = a.try_write(|a| -> Result<(), WriteError> {
+            a.try_write(|a| -> Result<(), WriteError> {
+                a.push_i64(1)?;
                 Ok(())
             })?;
             Err(WriteError::EmptyDocument)
         });
-        w.push_i64(99).unwrap();
+        a.push_i64(99).unwrap();
+        let w = a.end().unwrap();
         w.finish().unwrap();
     }
-    assert_eq!(decode(&buf), json!(99));
+    assert_eq!(decode(&buf), json!([99]));
 }
 
 #[test]
@@ -145,7 +147,7 @@ fn try_write_array_per_element_variants() {
 
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(3))).unwrap();
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(3))).unwrap();
         let mut a = w.start_array();
         for input in inputs.iter() {
             let attempted = a.try_write(|a| -> Result<(), WriteError> {
@@ -160,7 +162,7 @@ fn try_write_array_per_element_variants() {
                 a.push_null().unwrap();
             }
         }
-        a.end().unwrap();
+        let w = a.end().unwrap();
         w.finish().unwrap();
     }
     assert_eq!(
@@ -174,7 +176,7 @@ fn try_write_array_rollback_then_retry() {
     // Validator pattern: try variant A, on err rollback and try variant B.
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
         let mut a = w.start_array();
         for &v in &[1, 2, 3] {
             let attempted = a.try_write(|a| -> Result<(), WriteError> {
@@ -189,7 +191,7 @@ fn try_write_array_rollback_then_retry() {
                 a.push_i64(v).unwrap();
             }
         }
-        a.end().unwrap();
+        let w = a.end().unwrap();
         w.finish().unwrap();
     }
     assert_eq!(decode(&buf), json!(["s1", 2, "s3"]));
@@ -199,7 +201,7 @@ fn try_write_array_rollback_then_retry() {
 fn try_write_object_value_variant_with_rollback() {
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
         let mut o = w.start_object();
         o.push_str("name", "alice").unwrap();
         let _ = o.try_write(|o| -> Result<(), WriteError> {
@@ -207,7 +209,7 @@ fn try_write_object_value_variant_with_rollback() {
             Err(WriteError::EmptyDocument)
         });
         o.push_str("role", "guest").unwrap();
-        o.end().unwrap();
+        let w = o.end().unwrap();
         w.finish().unwrap();
     }
     assert_eq!(decode(&buf), json!({"name": "alice", "role": "guest"}));
@@ -217,7 +219,7 @@ fn try_write_object_value_variant_with_rollback() {
 fn try_write_mixed_nesting_object_with_variant_array() {
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
+        let w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(4))).unwrap();
         let mut o = w.start_object();
         o.push_str("kind", "user").unwrap();
         {
@@ -234,7 +236,7 @@ fn try_write_mixed_nesting_object_with_variant_array() {
             }
             tags.end().unwrap();
         }
-        o.end().unwrap();
+        let w = o.end().unwrap();
         w.finish().unwrap();
     }
     assert_eq!(
@@ -248,7 +250,7 @@ fn try_write_rollback_under_all_policies_matches_control() {
     for (name, policy) in policies() {
         let mut buf_with = Vec::new();
         {
-            let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
+            let w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
             let mut o = w.start_object();
             for i in 0..6 {
                 o.push_i64(&format!("k{i}"), i as i64).unwrap();
@@ -262,18 +264,18 @@ fn try_write_rollback_under_all_policies_matches_control() {
             for i in 6..10 {
                 o.push_i64(&format!("k{i}"), i as i64).unwrap();
             }
-            o.end().unwrap();
+            let w = o.end().unwrap();
             w.finish().unwrap();
         }
 
         let mut buf_no = Vec::new();
         {
-            let mut w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
+            let w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
             let mut o = w.start_object();
             for i in 0..10 {
                 o.push_i64(&format!("k{i}"), i as i64).unwrap();
             }
-            o.end().unwrap();
+            let w = o.end().unwrap();
             w.finish().unwrap();
         }
 
@@ -315,23 +317,23 @@ fn try_write_recovers_from_poison() {
 
     let sink = FailAfter {
         buf: Vec::new(),
-        budget: 8, // header (6) + a couple bytes; close will fail.
+        budget: 8, // header (6) + a couple bytes; further writes will fail.
     };
-    let mut w = Writer::with_options(sink, opts(BuildPolicy::compact(128))).unwrap();
-    let outcome = w.try_write(|w| -> Result<(), WriteError> {
-        let mut a = w.start_array();
+    let w = Writer::with_options(sink, opts(BuildPolicy::compact(128))).unwrap();
+    let mut a = w.start_array();
+    let entry = a.bytes_written();
+    let outcome = a.try_write(|a| -> Result<(), WriteError> {
         for _ in 0..16 {
             let _ = a.push_i64(1);
         }
-        // a's Drop will fail to flush; that poisons the writer. The
-        // closure still has to return some Err (or Ok) - we choose Err
-        // explicitly so try_write takes the rollback branch.
-        Err(WriteError::Io(io::Error::other("drop will fail")))
+        // Writes have likely poisoned the writer mid-closure; we return
+        // an explicit Err so try_write takes the rollback branch.
+        Err(WriteError::Io(io::Error::other("forced rollback")))
     });
     assert!(outcome.is_err());
-    // After rollback, position is restored to post-header and poison is
-    // cleared - the writer is fundamentally usable again.
-    assert_eq!(w.bytes_written(), 6, "position restored to post-header");
+    // After rollback, position is restored to the try_write entry point
+    // and poison is cleared - the builder is fundamentally usable again.
+    assert_eq!(a.bytes_written(), entry, "position restored to entry");
 }
 
 #[test]
@@ -355,13 +357,14 @@ fn try_write_rejects_already_poisoned_writer() {
     }
 
     // Construct a writer; the header write fails and poisons it.
-    let mut w = Writer::with_options(AlwaysFails, opts(BuildPolicy::compact(128))).unwrap();
+    let w = Writer::with_options(AlwaysFails, opts(BuildPolicy::compact(128))).unwrap();
+    let mut a = w.start_array();
     // Confirm precondition: writer is poisoned.
-    assert!(matches!(w.push_i64(1), Err(WriteError::Poisoned)));
+    assert!(matches!(a.push_i64(1), Err(WriteError::Poisoned)));
 
     // try_write must refuse, returning Poisoned without invoking the closure.
     let mut closure_ran = false;
-    let outcome: Result<(), WriteError> = w.try_write(|_w| {
+    let outcome: Result<(), WriteError> = a.try_write(|_a| {
         closure_ran = true;
         Ok(())
     });
@@ -370,104 +373,4 @@ fn try_write_rejects_already_poisoned_writer() {
         !closure_ran,
         "try_write must not run f on a poisoned writer"
     );
-}
-
-#[test]
-fn snapshot_trailer_yields_valid_document() {
-    for (name, policy) in policies() {
-        let mut buf = Vec::new();
-        let snapshot = {
-            let mut w = Writer::with_options(&mut buf, opts(policy.clone())).unwrap();
-            let mut a = w.start_array();
-            a.push_i64(10).unwrap();
-            a.push_str("hello").unwrap();
-            a.end().unwrap();
-            w.snapshot_trailer().unwrap()
-        };
-
-        let mut composed = buf[..snapshot.prefix_len as usize].to_vec();
-        composed.extend_from_slice(&snapshot.bytes);
-        let value = decode(&composed);
-        assert_eq!(value, json!([10, "hello"]), "policy={name}");
-    }
-}
-
-#[test]
-fn snapshot_accessors_match_assembled_doc() {
-    let mut buf = Vec::new();
-    let snap = {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(128))).unwrap();
-        let mut a = w.start_array();
-        a.push_i64(7).unwrap();
-        a.push_str("hi").unwrap();
-        a.end().unwrap();
-        w.snapshot_trailer().unwrap()
-    };
-
-    let mut composed = buf[..snap.prefix_len as usize].to_vec();
-    composed.extend_from_slice(&snap.bytes);
-
-    assert_eq!(snap.total_len() as usize, composed.len());
-    assert_eq!(snap.trailer_offset(), snap.total_len() - 12);
-
-    let trailer_start = snap.trailer_offset() as usize;
-    let stored_root = u64::from_le_bytes(
-        composed[trailer_start..trailer_start + 8]
-            .try_into()
-            .unwrap(),
-    );
-    assert_eq!(snap.root_offset(), stored_root);
-
-    let tag = composed[snap.root_offset() as usize];
-    assert!(
-        (0x70..=0x77).contains(&tag),
-        "expected array tag at root, got {tag:#x}"
-    );
-}
-
-#[test]
-fn snapshot_with_unfinalized_run_still_valid() {
-    let mut buf = Vec::new();
-    let snap = {
-        let mut w = Writer::with_options(&mut buf, opts(BuildPolicy::compact(2))).unwrap();
-        {
-            let mut a = w.start_array();
-            for i in 0..5 {
-                a.push_i64(i).unwrap();
-            }
-            a.end().unwrap();
-        }
-        w.snapshot_trailer().unwrap()
-    };
-    let mut composed = buf[..snap.prefix_len as usize].to_vec();
-    composed.extend_from_slice(&snap.bytes);
-    assert_eq!(decode(&composed), json!([0, 1, 2, 3, 4]));
-}
-
-#[test]
-fn snapshot_trailer_is_non_destructive() {
-    for (name, policy) in policies() {
-        let mut buf_with = Vec::new();
-        {
-            let mut w = Writer::with_options(&mut buf_with, opts(policy.clone())).unwrap();
-            let mut a = w.start_array();
-            a.push_i64(1).unwrap();
-            a.push_i64(2).unwrap();
-            a.end().unwrap();
-            let _snap = w.snapshot_trailer().unwrap();
-            w.finish().unwrap();
-        }
-
-        let mut buf_no = Vec::new();
-        {
-            let mut w = Writer::with_options(&mut buf_no, opts(policy)).unwrap();
-            let mut a = w.start_array();
-            a.push_i64(1).unwrap();
-            a.push_i64(2).unwrap();
-            a.end().unwrap();
-            w.finish().unwrap();
-        }
-
-        assert_eq!(buf_with, buf_no, "policy={name}");
-    }
 }

@@ -3,30 +3,29 @@ use std::io;
 
 /// Errors returned by the writer.
 ///
-/// Variants cover I/O failures, value-shape problems (NaN/±∞ floats),
-/// and structural errors (empty document, multiple roots, invalid options).
-/// API misuse (mismatched key/value pushes, double-finish) is prevented
-/// by the builder borrow-checker and `finish(self)` consuming the writer,
-/// so it does not appear here.
-///
-/// Once any operation returns an error, the writer becomes *poisoned*
-/// and subsequent calls fail with [`WriteError::Poisoned`] instead of
-/// producing a malformed document.
+/// After any error mid-document the writer is *poisoned*: subsequent
+/// calls fail with [`WriteError::Poisoned`] instead of producing a
+/// malformed document.
 #[derive(Debug)]
 pub enum WriteError {
     /// The underlying [`Sink`](crate::Sink) returned an `io::Error`.
     Io(io::Error),
-    /// `f64` was NaN or ±∞, neither of which is representable.
+    /// `f64` was NaN or ±∞.
     NaNOrInfinity,
-    /// [`Writer::finish`](crate::Writer::finish) was called before any
-    /// root value was pushed.
+    /// [`Writer::finish`](crate::Writer::finish) was called with no root
+    /// value.
     EmptyDocument,
-    /// More than one root value was pushed at the writer level.
+    /// More than one root value was pushed.
     MultipleRootValues,
     /// A previous error left the writer in an unrecoverable state.
     Poisoned,
     /// [`WriterOptions`](crate::WriterOptions) failed validation.
     InvalidOption(&'static str),
+    /// `RawWriter::end_array` / `end_object` was called with a
+    /// mismatched or absent top frame.
+    FrameMismatch,
+    /// `RawWriter::push_key` was called outside an object frame.
+    KeyOutsideObject,
 }
 
 impl fmt::Display for WriteError {
@@ -38,6 +37,12 @@ impl fmt::Display for WriteError {
             WriteError::MultipleRootValues => write!(f, "more than one root value pushed"),
             WriteError::Poisoned => write!(f, "writer poisoned by prior error"),
             WriteError::InvalidOption(s) => write!(f, "invalid writer option: {}", s),
+            WriteError::FrameMismatch => {
+                write!(f, "raw writer close did not match the open frame")
+            }
+            WriteError::KeyOutsideObject => {
+                write!(f, "raw writer key push outside an object frame")
+            }
         }
     }
 }

@@ -6,15 +6,18 @@ mod common;
 
 use common::encode::root_offset;
 use common::walker::assert_no_m_below_2;
-use kahon::{BuildPolicy, Writer, WriterOptions};
+use kahon::{BuildPolicy, Empty, Filled, Writer, WriterOptions};
 
 /// Build a doc with custom options and return the bytes; small wrapper so the
 /// invariant tests below stay focused on the structural assertion.
-fn build_with<F: FnOnce(&mut Writer<&mut Vec<u8>>)>(opts: WriterOptions, f: F) -> Vec<u8> {
+fn build_with<F>(opts: WriterOptions, f: F) -> Vec<u8>
+where
+    F: for<'a> FnOnce(Writer<&'a mut Vec<u8>, Empty>) -> Writer<&'a mut Vec<u8>, Filled>,
+{
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts).unwrap();
-        f(&mut w);
+        let w = Writer::with_options(&mut buf, opts).unwrap();
+        let w = f(w);
         w.finish().unwrap();
     }
     buf
@@ -33,7 +36,7 @@ fn array_with_uneven_levels_keeps_m_at_least_2() {
         for i in 0i64..5 {
             a.push_i64(i).unwrap();
         }
-        a.end().unwrap();
+        a.end().unwrap()
     });
     assert_no_m_below_2(&buf, root_offset(&buf));
 }
@@ -51,7 +54,7 @@ fn single_run_object_with_uneven_levels_keeps_m_at_least_2() {
         for &k in &["a", "b", "c", "d", "e"] {
             o.push_i64(k, 0).unwrap();
         }
-        o.end().unwrap();
+        o.end().unwrap()
     });
     assert_no_m_below_2(&buf, root_offset(&buf));
 }
@@ -69,7 +72,7 @@ fn multi_run_object_with_trailing_singleton_keeps_m_at_least_2() {
         for &k in &["a", "b", "c", "d", "e"] {
             o.push_i64(k, 0).unwrap();
         }
-        o.end().unwrap();
+        o.end().unwrap()
     });
     assert_no_m_below_2(&buf, root_offset(&buf));
 }
