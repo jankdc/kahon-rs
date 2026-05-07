@@ -3,22 +3,10 @@ use crate::raw_writer::RawWriter;
 use crate::sink::{RewindableSink, Sink};
 use crate::writer::{Filled, Writer};
 
-// ---------------------------------------------------------------------
-// Root builders
-//
-// Root builders own the underlying RawWriter outright (instead of
-// borrowing it like the nested builders do), because they have to
-// transition the safe-API state from `Empty` to `Filled` on close - a
-// type-level change that requires consuming `self`.
-// ---------------------------------------------------------------------
-
-/// Root-level array builder. Consumes a [`Writer<S, Empty>`] and yields
-/// a [`Writer<S, Filled>`] when [`end`](Self::end) is called.
-///
-/// The `#[must_use]` lint catches the obvious footgun: dropping the
-/// builder without calling `.end()` leaves the document incomplete (no
-/// trailer ever gets written), so make sure the builder's value is
-/// either bound or threaded through to `.end()`.
+/// Root-level array builder. Returned by
+/// [`Writer::start_array`](crate::Writer::start_array). Call
+/// [`.end()`](Self::end) to recover the [`Writer`] for `finish` -
+/// dropping without `.end()` leaves the document with no trailer.
 #[must_use = "the document is unfinished until you call .end() on the root builder"]
 pub struct RootArrayBuilder<S: Sink> {
     w: RawWriter<S>,
@@ -47,7 +35,8 @@ impl<S: Sink> RootArrayBuilder<S> {
     pub fn push_u64(&mut self, v: u64) -> Result<(), WriteError> {
         self.w.push_u64(v)
     }
-    /// Append a 64-bit float. NaN and ±∞ are rejected.
+    /// Append a 64-bit float. Returns [`WriteError::NaNOrInfinity`] for
+    /// NaN or ±∞.
     pub fn push_f64(&mut self, v: f64) -> Result<(), WriteError> {
         self.w.push_f64(v)
     }
@@ -76,14 +65,11 @@ impl<S: Sink> RootArrayBuilder<S> {
         ObjectBuilder::new(&mut self.w)
     }
 
-    /// Close the array, propagating any error from the final flush, and
-    /// return a [`Writer<S, Filled>`] ready for `finish`.
+    /// Close the array and return a [`Writer`] ready for
+    /// [`finish`](Writer::finish).
     pub fn end(mut self) -> Result<Writer<S, Filled>, WriteError> {
         self.closed = true;
         self.w.close_array_frame()?;
-        // Take ownership of `self.raw` without running Drop. Replacing
-        // with a moved-out `RawWriter` would require it to be `Default`;
-        // instead we just `mem::replace` via a `ManuallyDrop` dance.
         let raw = unsafe { std::ptr::read(&self.w) };
         std::mem::forget(self);
         Ok(Writer::from_raw(raw))
@@ -92,10 +78,6 @@ impl<S: Sink> RootArrayBuilder<S> {
 
 impl<S: Sink> Drop for RootArrayBuilder<S> {
     fn drop(&mut self) {
-        // Best-effort close so internal state is consistent. The writer
-        // is owned here, so any error has nowhere to go - the caller
-        // already lost access to the document by ignoring the
-        // `must_use`. The doc on disk will lack a trailer.
         if !self.closed {
             let _ = self.w.close_array_frame();
         }
@@ -128,10 +110,10 @@ impl<S: RewindableSink> RootArrayBuilder<S> {
     }
 }
 
-/// Root-level object builder. Consumes a [`Writer<S, Empty>`] and yields
-/// a [`Writer<S, Filled>`] when [`end`](Self::end) is called.
-///
-/// See [`RootArrayBuilder`] for notes on the `must_use` invariant.
+/// Root-level object builder. Returned by
+/// [`Writer::start_object`](crate::Writer::start_object). Call
+/// [`.end()`](Self::end) to recover the [`Writer`] for `finish` -
+/// dropping without `.end()` leaves the document with no trailer.
 #[must_use = "the document is unfinished until you call .end() on the root builder"]
 pub struct RootObjectBuilder<S: Sink> {
     w: RawWriter<S>,
@@ -164,7 +146,8 @@ impl<S: Sink> RootObjectBuilder<S> {
         self.w.set_pending_key(key)?;
         self.w.push_u64(v)
     }
-    /// Insert a 64-bit float at `key`. NaN and ±∞ are rejected.
+    /// Insert a 64-bit float at `key`. Returns
+    /// [`WriteError::NaNOrInfinity`] for NaN or ±∞.
     pub fn push_f64(&mut self, key: &str, v: f64) -> Result<(), WriteError> {
         self.w.set_pending_key(key)?;
         self.w.push_f64(v)
@@ -197,8 +180,8 @@ impl<S: Sink> RootObjectBuilder<S> {
         Ok(ObjectBuilder::new(&mut self.w))
     }
 
-    /// Close the object, propagating any error from the final flush, and
-    /// return a [`Writer<S, Filled>`] ready for `finish`.
+    /// Close the object and return a [`Writer`] ready for
+    /// [`finish`](Writer::finish).
     pub fn end(mut self) -> Result<Writer<S, Filled>, WriteError> {
         self.closed = true;
         self.w.close_object_frame()?;
@@ -242,15 +225,9 @@ impl<S: RewindableSink> RootObjectBuilder<S> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Nested builders - borrow `&mut RawWriter`. Unchanged in spirit from
-// before the typestate refactor; only `Drop`/`end` semantics matter
-// here, not state transitions.
-// ---------------------------------------------------------------------
-
-/// Handle for building a nested array. Borrows its parent writer
-/// mutably; drops close the array automatically. Use
-/// [`ArrayBuilder::end`] for explicit, error-propagating close.
+/// Handle for a nested array. Closes on drop; call
+/// [`.end()?`](Self::end) instead to surface close errors as a
+/// `Result`.
 pub struct ArrayBuilder<'a, S: Sink> {
     w: &'a mut RawWriter<S>,
     closed: bool,
@@ -277,7 +254,8 @@ impl<'a, S: Sink> ArrayBuilder<'a, S> {
     pub fn push_u64(&mut self, v: u64) -> Result<(), WriteError> {
         self.w.push_u64(v)
     }
-    /// Append a 64-bit float. NaN and ±∞ are rejected.
+    /// Append a 64-bit float. Returns [`WriteError::NaNOrInfinity`] for
+    /// NaN or ±∞.
     pub fn push_f64(&mut self, v: f64) -> Result<(), WriteError> {
         self.w.push_f64(v)
     }
@@ -306,8 +284,7 @@ impl<'a, S: Sink> ArrayBuilder<'a, S> {
         ObjectBuilder::new(&mut *self.w)
     }
 
-    /// Close the array, propagating any error from the final flush.
-    /// Prefer this over relying on `Drop` whenever you care about errors.
+    /// Explicitly close the array, surfacing any close error.
     pub fn end(mut self) -> Result<(), WriteError> {
         self.closed = true;
         self.w.close_array_frame()
@@ -348,8 +325,9 @@ impl<S: RewindableSink> ArrayBuilder<'_, S> {
     }
 }
 
-/// Handle for building a nested object. Keys are passed positionally
-/// before their value. Drops close the object automatically.
+/// Handle for a nested object. Keys are passed positionally before
+/// their value. Closes on drop; call [`.end()?`](Self::end) to surface
+/// close errors as a `Result`.
 pub struct ObjectBuilder<'a, S: Sink> {
     w: &'a mut RawWriter<S>,
     closed: bool,
@@ -380,7 +358,8 @@ impl<'a, S: Sink> ObjectBuilder<'a, S> {
         self.w.set_pending_key(key)?;
         self.w.push_u64(v)
     }
-    /// Insert a 64-bit float at `key`. NaN and ±∞ are rejected.
+    /// Insert a 64-bit float at `key`. Returns
+    /// [`WriteError::NaNOrInfinity`] for NaN or ±∞.
     pub fn push_f64(&mut self, key: &str, v: f64) -> Result<(), WriteError> {
         self.w.set_pending_key(key)?;
         self.w.push_f64(v)
@@ -413,8 +392,7 @@ impl<'a, S: Sink> ObjectBuilder<'a, S> {
         Ok(ObjectBuilder::new(&mut *self.w))
     }
 
-    /// Close the object, propagating any error from the final flush.
-    /// Prefer this over relying on `Drop` whenever you care about errors.
+    /// Explicitly close the object, surfacing any close error.
     pub fn end(mut self) -> Result<(), WriteError> {
         self.closed = true;
         self.w.close_object_frame()

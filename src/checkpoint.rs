@@ -10,69 +10,44 @@ use crate::types::MAGIC;
 
 /// Closing bytes for a kahon document as it stands at a point in time.
 ///
-/// Returned by [`RawWriter::snapshot_trailer`]. The bytes a reader needs to
-/// see a complete kahon document are the first `prefix_len` bytes of
-/// whatever the writer has emitted, concatenated with [`bytes`]. Useful
-/// for publishing snapshots of an in-progress document without disturbing
-/// the live writer.
-///
-/// `bytes` includes any closing B+tree internal nodes for open frames plus
-/// the 12-byte trailer (spec §10.2), so its length is always `>= 12`.
-///
-/// [`bytes`]: TrailerSnapshot::bytes
+/// A complete kahon document can be assembled by concatenating the
+/// first [`prefix_len`](Self::prefix_len) bytes of the writer's sink
+/// with [`bytes`](Self::bytes). Useful for publishing snapshots of an
+/// in-progress document without disturbing the live writer.
 #[derive(Debug, Clone)]
 pub struct TrailerSnapshot {
-    /// Number of bytes from the start of the writer's sink that participate
-    /// in the snapshot. Equal to [`RawWriter::bytes_written`] at the call
-    /// site.
+    /// Number of bytes from the start of the writer's sink that
+    /// participate in the snapshot.
     pub prefix_len: u64,
-    /// Closing bytes to append after the prefix to form a complete kahon
-    /// document. Length is `>= 12`.
+    /// Closing bytes to append after the prefix. Length is `>= 12`.
     pub bytes: Vec<u8>,
 }
 
 impl TrailerSnapshot {
-    /// Total length of the assembled snapshot document, in bytes.
-    ///
-    /// Equal to `prefix_len + bytes.len()`. Useful for `pread`-style
-    /// consumers that need to know the doc's logical end before reading.
+    /// Total length of the assembled snapshot document.
     pub fn total_len(&self) -> u64 {
         self.prefix_len + self.bytes.len() as u64
     }
 
-    /// Absolute offset of the root value's type-code byte in the assembled
-    /// snapshot.
-    ///
-    /// Recovered from the 12-byte trailer at the tail of [`bytes`]. Saves
-    /// a consumer the round trip of reading the trailer themselves before
-    /// jumping to the root.
-    ///
-    /// [`bytes`]: TrailerSnapshot::bytes
+    /// Absolute offset of the root value in the assembled snapshot.
     pub fn root_offset(&self) -> u64 {
-        // The trailer is the last 12 bytes of `bytes`: 8-byte little-endian
-        // root_offset followed by the 4-byte "KAHN" magic.
         let n = self.bytes.len();
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.bytes[n - 12..n - 4]);
         u64::from_le_bytes(buf)
     }
 
-    /// Absolute offset where the 12-byte trailer begins in the assembled
-    /// snapshot.
-    ///
-    /// Equal to `total_len() - 12`. Useful for consumers that want to
-    /// `pread` the trailer directly.
+    /// Absolute offset where the 12-byte trailer begins in the
+    /// assembled snapshot. Equal to `total_len() - 12`.
     pub fn trailer_offset(&self) -> u64 {
         self.total_len() - 12
     }
 }
 
-/// Save-state for [`RawWriter::checkpoint`] / [`RawWriter::rollback`]
-/// (and the closure-shaped
-/// [`RawWriter::try_write`](RawWriter::try_write)).
+/// Save-state for [`RawWriter::checkpoint`] / [`RawWriter::rollback`].
 ///
-/// Cheap to capture and to drop. Dropping a `Checkpoint` without calling
-/// [`rollback`](RawWriter::rollback) commits the speculative writes.
+/// Dropping a `Checkpoint` without rolling back commits the speculative
+/// writes.
 pub struct Checkpoint {
     pos: u64,
     padding_written: u64,
@@ -81,10 +56,6 @@ pub struct Checkpoint {
     poisoned: bool,
 }
 
-/// Synthesize the closing bytes for the document represented by `raw`,
-/// without modifying it. Implementation shared by both
-/// `RawWriter::snapshot_trailer` and
-/// [`Writer::snapshot_trailer`](crate::Writer::snapshot_trailer).
 pub(crate) fn snapshot_trailer<S: Sink>(raw: &RawWriter<S>) -> Result<TrailerSnapshot, WriteError> {
     if raw.poisoned {
         return Err(WriteError::Poisoned);
@@ -163,9 +134,9 @@ pub(crate) fn snapshot_trailer<S: Sink>(raw: &RawWriter<S>) -> Result<TrailerSna
 }
 
 impl<S: RewindableSink> RawWriter<S> {
-    /// Capture a save-state for speculative writes. Cheap;
-    /// non-mutating. Pair with [`rollback`](Self::rollback) to revert,
-    /// or drop the [`Checkpoint`] to commit.
+    /// Capture a save-state for speculative writes. Pair with
+    /// [`rollback`](Self::rollback) to revert; drop the [`Checkpoint`]
+    /// to commit.
     pub fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             pos: self.pos,
@@ -176,11 +147,9 @@ impl<S: RewindableSink> RawWriter<S> {
         }
     }
 
-    /// Restore the writer to the captured save-state. Truncates the
-    /// sink, restores the frame stack, and clears the poison flag if
-    /// it was clean at capture time.
+    /// Restore the writer to a captured save-state.
     ///
-    /// Errors with [`WriteError::Io`] if the sink truncate fails; the
+    /// Returns [`WriteError::Io`] if the sink truncate fails; the
     /// writer is poisoned in that case.
     pub fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
         if let Err(e) = self.sink.rewind_to(cp.pos) {
@@ -197,10 +166,12 @@ impl<S: RewindableSink> RawWriter<S> {
         Ok(())
     }
 
-    /// Run `f` as a speculative write. If `f` returns `Ok`, the writes
-    /// are kept; if `Err`, every byte written and every frame opened
-    /// since the call is rolled back (poison flag included) and the
-    /// error is propagated.
+    /// Run `f` as a speculative write: on `Ok`, the writes commit; on
+    /// `Err`, every byte and frame opened by `f` is rolled back and
+    /// the error is propagated.
+    ///
+    /// Note: this is not a transaction - there is no `fsync`, and the
+    /// rollback only undoes in-memory state and truncates the sink.
     ///
     /// ```ignore
     /// raw.try_write(|raw| {
@@ -210,19 +181,8 @@ impl<S: RewindableSink> RawWriter<S> {
     /// })?;
     /// ```
     ///
-    /// # What `try_write` does *not* do
-    ///
-    /// Despite the rollback semantics, this is **not** a database
-    ///
-    /// # Errors
-    ///
-    /// - [`WriteError::Poisoned`] if the writer is already poisoned at
-    ///   entry. Like every other op, `try_write` refuses to run on a
-    ///   poisoned writer; once poisoned, the document is unrecoverable.
-    /// - If `f` returns `Err`, `try_write` rolls back and propagates the
-    ///   error. If rollback itself fails (sink truncate I/O error), the
-    ///   writer is poisoned and the I/O error is returned via
-    ///   `E::from(WriteError)`.
+    /// If rollback itself fails (sink truncate I/O error), the writer
+    /// is poisoned and the I/O error is returned via `E::from(WriteError)`.
     pub fn try_write<F, T, E>(&mut self, f: F) -> Result<T, E>
     where
         F: FnOnce(&mut Self) -> Result<T, E>,

@@ -9,7 +9,7 @@ const TRAILER_LEN: usize = 12;
 
 /// Build a document by driving a fresh `Writer`. The closure receives a
 /// writer in the `Empty` state and must return the (same) writer in the
-/// `Filled` state — i.e. with a root pushed. Panics on encode error so
+/// `Filled` state - i.e. with a root pushed. Panics on encode error so
 /// individual tests stay focused on the assertion, not the plumbing.
 ///
 /// Uses the compact (fanout=128, no padding) policy so byte-level tests can

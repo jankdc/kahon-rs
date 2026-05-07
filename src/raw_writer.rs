@@ -1,12 +1,9 @@
-//! Flat, runtime-checked writer surface for advanced integrations.
+//! Flat, writer surface for advanced integrations.
 //!
-//! `RawWriter` owns the writer's state and primitive operations; the
-//! safe, typestate-guarded builder API in [`Writer`](crate::Writer) is
-//! a thin newtype wrapper over it.
-//!
-//! Mismatched frames, forgotten closes, and `push_key` outside an
-//! object are runtime errors here. The builder API rules them out at
-//! compile time; the flat API trades that guarantee for composability.
+//! Use this when the typed builder API in [`Writer`](crate::Writer) is
+//! awkward.
+//! Mismatched frames and `push_key` outside an object surface as
+//! runtime errors instead of compile errors.
 
 use crate::align::write_padding;
 use crate::bplus::ArrayBPlusBuilder;
@@ -20,12 +17,9 @@ use crate::types::{FLAGS, MAGIC, VERSION};
 
 /// Flat, runtime-checked streaming writer over a [`Sink`].
 ///
-/// `RawWriter` is the lower-level surface: it holds the document state
-/// and exposes a flat API.
-/// 
-/// Most users want [`Writer`] and its builders; reach for `RawWriter`
-/// when you need a flat API for FFI bridges, async stream parsers, or
-/// storage-engine adapters.
+/// Most users want [`Writer`](crate::Writer) and its builders. Reach
+/// for `RawWriter` when the typed API is awkward: FFI, async parsers,
+/// storage adapters.
 pub struct RawWriter<S: Sink> {
     pub(crate) sink: S,
     pub(crate) pos: u64,
@@ -38,10 +32,10 @@ pub struct RawWriter<S: Sink> {
 }
 
 impl<S: Sink> RawWriter<S> {
-    /// Create a raw writer with default options ([`WriterOptions::default`]).
+    /// Create a raw writer with default options.
     ///
-    /// The header is written eagerly; if that initial write fails, the
-    /// writer is poisoned and the error surfaces on the next operation.
+    /// I/O errors from the initial header write are deferred and
+    /// surface on the first push or `finish`.
     pub fn new(sink: S) -> Self {
         // Default policy is statically known-valid; unwrap is safe.
         Self::with_options(sink, WriterOptions::default())
@@ -50,8 +44,8 @@ impl<S: Sink> RawWriter<S> {
 
     /// Create a raw writer with caller-supplied [`WriterOptions`].
     ///
-    /// Returns [`WriteError::InvalidOption`] if the policy is malformed
-    /// (fanout < 2, target bytes < 64, or non–power-of-two page size).
+    /// Returns [`WriteError::InvalidOption`] if the options fail
+    /// validation.
     pub fn with_options(sink: S, opts: WriterOptions) -> Result<Self, WriteError> {
         opts.policy.validate()?;
         let mut w = Self {
@@ -72,15 +66,13 @@ impl<S: Sink> RawWriter<S> {
         Ok(w)
     }
 
-    /// Total bytes emitted to the sink so far, including the header,
-    /// every flushed value/node, and any alignment padding.
+    /// Total bytes emitted to the sink so far.
     pub fn bytes_written(&self) -> u64 {
         self.pos
     }
 
-    /// Approximate live in-memory footprint of the writer's working buffers:
-    /// the scratch encoding buffer, plus per-frame B+tree buffers and object
-    /// run state. Useful for profiling peak memory across configurations.
+    /// Approximate live in-memory footprint of the writer's working
+    /// buffers. Useful for profiling memory across configurations.
     pub fn buffered_bytes(&self) -> usize {
         let mut total = self.scratch.capacity();
         total += self.frames.capacity() * std::mem::size_of::<Frame>();
@@ -102,9 +94,8 @@ impl<S: Sink> RawWriter<S> {
         total
     }
 
-    /// Total bytes of unreferenced filler emitted by the page-alignment
-    /// policy (zero when [`PageAlignment::None`] is in effect). Useful for
-    /// quantifying the cost of disk-friendly layout.
+    /// Bytes of unreferenced padding emitted under
+    /// [`PageAlignment::Aligned`] (zero otherwise).
     pub fn padding_bytes_written(&self) -> u64 {
         self.padding_written
     }
@@ -113,8 +104,7 @@ impl<S: Sink> RawWriter<S> {
     // Scalars
     // ------------------------------------------------------------------
 
-    /// Push a `null` as the document root, or as the next array
-    /// element / object value.
+    /// Push a `null` (root, array element, or object value).
     pub fn push_null(&mut self) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| {
@@ -138,16 +128,14 @@ impl<S: Sink> RawWriter<S> {
         self.register_value(off)
     }
 
-    /// Push a signed 64-bit integer. Encoded in the narrowest tag that
-    /// fits the value.
+    /// Push a signed 64-bit integer.
     pub fn push_i64(&mut self, v: i64) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| write_integer(b, v as i128))?;
         self.register_value(off)
     }
 
-    /// Push an unsigned 64-bit integer. Values up to `2^64 - 1` are
-    /// representable; encoded in the narrowest tag that fits.
+    /// Push an unsigned 64-bit integer.
     pub fn push_u64(&mut self, v: u64) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| write_integer(b, v as i128))?;
@@ -163,8 +151,7 @@ impl<S: Sink> RawWriter<S> {
         self.register_value(off)
     }
 
-    /// Push a UTF-8 string. The bytes are written as-is; no escaping is
-    /// applied.
+    /// Push a UTF-8 string.
     pub fn push_str(&mut self, s: &str) -> Result<(), WriteError> {
         self.check_ready()?;
         let off = self.emit_scalar(|b| {
@@ -175,8 +162,6 @@ impl<S: Sink> RawWriter<S> {
     }
 
     /// Open an array frame. Pair with [`end_array`](Self::end_array).
-    ///
-    /// Returns [`WriteError::Poisoned`] if the writer is poisoned.
     pub fn begin_array(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
@@ -187,10 +172,8 @@ impl<S: Sink> RawWriter<S> {
 
     /// Close the open array frame.
     ///
-    /// Errors:
-    /// - [`WriteError::Poisoned`] if the writer is poisoned.
-    /// - [`WriteError::FrameMismatch`] if the top frame is not an
-    ///   array (or no frame is open).
+    /// Returns [`WriteError::FrameMismatch`] if the top frame is not an
+    /// array.
     pub fn end_array(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
@@ -201,10 +184,8 @@ impl<S: Sink> RawWriter<S> {
         }
     }
 
-    /// Open an object frame. Pair with [`end_object`](Self::end_object).
-    /// Use [`push_key`](Self::push_key) before each value.
-    ///
-    /// Returns [`WriteError::Poisoned`] if the writer is poisoned.
+    /// Open an object frame. Pair with [`end_object`](Self::end_object);
+    /// call [`push_key`](Self::push_key) before each value.
     pub fn begin_object(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
@@ -215,10 +196,8 @@ impl<S: Sink> RawWriter<S> {
 
     /// Close the open object frame.
     ///
-    /// Errors:
-    /// - [`WriteError::Poisoned`] if the writer is poisoned.
-    /// - [`WriteError::FrameMismatch`] if the top frame is not an
-    ///   object (or no frame is open).
+    /// Returns [`WriteError::FrameMismatch`] if the top frame is not an
+    /// object.
     pub fn end_object(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
@@ -231,10 +210,8 @@ impl<S: Sink> RawWriter<S> {
 
     /// Set the key for the next value pushed into the open object.
     ///
-    /// Errors:
-    /// - [`WriteError::Poisoned`] if the writer is poisoned.
-    /// - [`WriteError::KeyOutsideObject`] if the top frame is not an
-    ///   object.
+    /// Returns [`WriteError::KeyOutsideObject`] if the top frame is not
+    /// an object.
     pub fn push_key(&mut self, key: &str) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
@@ -249,11 +226,10 @@ impl<S: Sink> RawWriter<S> {
     // Finalization
     // ------------------------------------------------------------------
 
-    /// Finalize the document by writing the 12-byte trailer and return
-    /// the underlying sink.
+    /// Finalize the document and return the underlying sink.
     ///
-    /// Errors if the writer is poisoned, has open container frames, or
-    /// never received a root value ([`WriteError::EmptyDocument`]).
+    /// Returns [`WriteError::EmptyDocument`] if no root was pushed.
+    /// Errors if any container frames are still open.
     pub fn finish(mut self) -> Result<S, WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
@@ -360,7 +336,8 @@ impl<S: Sink> RawWriter<S> {
     // Snapshot
     // ------------------------------------------------------------------
 
-    /// See [`Writer::snapshot_trailer`](crate::Writer::snapshot_trailer).
+    /// Synthesize the closing bytes for the document as it stands,
+    /// without disturbing the writer. See [`TrailerSnapshot`].
     pub fn snapshot_trailer(&self) -> Result<TrailerSnapshot, WriteError> {
         crate::checkpoint::snapshot_trailer(self)
     }

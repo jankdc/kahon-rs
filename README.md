@@ -50,7 +50,7 @@ document.
 Nested builders close themselves on `Drop`; call `.end()` to surface
 errors rather than swallow them into the writer's poison flag. Root
 builders carry `#[must_use]`, so dropping one without `.end()`
-triggers a lint — without `.end()` the writer is lost and the document
+triggers a lint - without `.end()` the writer is lost and the document
 is left without a trailer.
 
 ## Tuning
