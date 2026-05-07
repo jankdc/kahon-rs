@@ -7,7 +7,6 @@
 
 use crate::align::write_padding;
 use crate::bplus::ArrayBPlusBuilder;
-use crate::checkpoint::TrailerSnapshot;
 use crate::config::{PageAlignment, WriterOptions};
 use crate::encode::{write_f64, write_false, write_integer, write_null, write_string, write_true};
 use crate::error::WriteError;
@@ -330,16 +329,6 @@ impl<S: Sink> RawWriter<S> {
         };
         let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
         self.register_value(root_off)
-    }
-
-    // ------------------------------------------------------------------
-    // Snapshot
-    // ------------------------------------------------------------------
-
-    /// Synthesize the closing bytes for the document as it stands,
-    /// without disturbing the writer. See [`TrailerSnapshot`].
-    pub fn snapshot_trailer(&self) -> Result<TrailerSnapshot, WriteError> {
-        crate::checkpoint::snapshot_trailer(self)
     }
 
     // ------------------------------------------------------------------
