@@ -27,6 +27,12 @@ pub enum WriteError {
     Poisoned,
     /// [`WriterOptions`](crate::WriterOptions) failed validation.
     InvalidOption(&'static str),
+    /// A `RawWriter` close (`end_array` / `end_object`) was called with a
+    /// mismatched or absent top frame. The builder API turns this case
+    /// into a compile error; the flat API surfaces it at runtime.
+    FrameMismatch,
+    /// `RawWriter::push_key` was called outside an object frame.
+    KeyOutsideObject,
 }
 
 impl fmt::Display for WriteError {
@@ -38,6 +44,12 @@ impl fmt::Display for WriteError {
             WriteError::MultipleRootValues => write!(f, "more than one root value pushed"),
             WriteError::Poisoned => write!(f, "writer poisoned by prior error"),
             WriteError::InvalidOption(s) => write!(f, "invalid writer option: {}", s),
+            WriteError::FrameMismatch => {
+                write!(f, "raw writer close did not match the open frame")
+            }
+            WriteError::KeyOutsideObject => {
+                write!(f, "raw writer key push outside an object frame")
+            }
         }
     }
 }

@@ -241,7 +241,7 @@ impl<S: RewindableSink> Writer<S> {
         }
     }
 
-    pub(crate) fn checkpoint(&mut self) -> Checkpoint {
+    pub(crate) fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             pos: self.pos,
             padding_written: self.padding_written,

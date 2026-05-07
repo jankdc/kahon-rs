@@ -70,6 +70,14 @@ impl<S: Sink> Writer<S> {
         self.pos
     }
 
+    /// Promote to the flat [`RawWriter`](crate::raw::RawWriter) surface
+    /// for advanced integrations. The builder API becomes unavailable
+    /// until [`RawWriter::into_safe`](crate::raw::RawWriter::into_safe).
+    /// Open frames are preserved across the conversion.
+    pub fn into_raw(self) -> crate::raw::RawWriter<S> {
+        crate::raw::RawWriter::from_writer(self)
+    }
+
     /// Total bytes of unreferenced filler emitted by the page-alignment
     /// policy (zero when [`PageAlignment::None`] is in effect). Useful for
     /// quantifying the cost of disk-friendly layout.

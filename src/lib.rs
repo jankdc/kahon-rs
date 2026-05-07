@@ -115,9 +115,18 @@ mod config;
 mod encode;
 mod error;
 mod frame;
+mod raw_writer;
 mod sink;
 mod types;
 mod writer;
+
+/// Flat, runtime-checked writer surface for advanced integrations
+/// (storage-engine adapters, async stream parsers, FFI bridges).
+/// Most users want [`Writer`] and its builders. See [`raw`] module
+/// docs for details.
+pub mod raw {
+    pub use crate::raw_writer::{Checkpoint, RawWriter};
+}
 
 pub use builder::{ArrayBuilder, ObjectBuilder};
 pub use checkpoint::TrailerSnapshot;
