@@ -1,10 +1,10 @@
 //! Speculative writes and snapshot trailer.
 
-use crate::Writer;
 use crate::error::WriteError;
-use crate::frame::{Frame};
+use crate::frame::Frame;
 use crate::raw_writer::RawWriter;
-use crate::sink::{RewindableSink};
+use crate::sink::RewindableSink;
+use crate::Writer;
 
 /// Save-state for [`RawWriter::checkpoint`] / [`RawWriter::rollback`].
 ///

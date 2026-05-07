@@ -101,9 +101,9 @@ mod error;
 mod frame;
 mod raw_writer;
 mod sink;
+mod trailer;
 mod types;
 mod writer;
-mod trailer;
 
 /// Flat, runtime-checked writer surface for advanced integrations
 /// (FFI bridges, async stream parsers, storage adapters). Most users
@@ -114,10 +114,10 @@ pub mod raw {
 }
 
 pub use builder::{ArrayBuilder, ObjectBuilder, RootArrayBuilder, RootObjectBuilder};
-pub use trailer::TrailerSnapshot;
 pub use config::{BuildPolicy, NodeSizing, PageAlignment, WriterOptions};
 pub use error::WriteError;
 pub use sink::{RewindableSink, Sink};
+pub use trailer::TrailerSnapshot;
 pub use writer::{Empty, Filled, Writer};
 
 /// Convenience alias for `std::result::Result<T, WriteError>`.

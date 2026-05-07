@@ -121,5 +121,4 @@ impl<S: RewindableSink> RawWriter<S> {
             bytes: tail,
         })
     }
-
 }

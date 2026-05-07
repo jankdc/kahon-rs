@@ -1,10 +1,10 @@
 use std::marker::PhantomData;
 
-use crate::{RootArrayBuilder, RootObjectBuilder};
 use crate::config::WriterOptions;
 use crate::error::WriteError;
 use crate::raw_writer::RawWriter;
 use crate::sink::Sink;
+use crate::{RootArrayBuilder, RootObjectBuilder};
 
 /// Typestate marker: writer has not yet received its root value.
 /// Exposes the `push_*` and `start_*` methods.
