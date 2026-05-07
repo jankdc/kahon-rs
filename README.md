@@ -2,18 +2,14 @@
 
 A Rust writer for the [Kahon binary format](https://github.com/jankdc/kahon).
 
-## Features
-
-- Values are written as they arrive; containers reference children by back-offset. Memory stays bounded by tree depth, not document size.
-- Arrays and objects are B+trees on disk: index into a million-element array, or look up a key in a million-key object, without scanning.
-- Fixed-fanout for tight in-memory output, or page-aligned target-byte sizing for files that will be `pread`-ed or memory-mapped.
-- Typestate builder API: "exactly one root value per document" is enforced at compile time, not at runtime.
 
 ## Usage
 
 ```
 cargo add kahon
 ```
+
+### Builder API
 
 ```rust
 use kahon::Writer;
@@ -40,18 +36,45 @@ let w = monster.end()?;
 w.finish()?;
 ```
 
-The safe builder API uses *typestate* to enforce "exactly one root
-value per document" at compile time: `Writer<S, Empty>` exposes
-`push_*` and `start_*` (each consuming `self`), and
-`Writer<S, Filled>` exposes only `finish` and `snapshot_trailer`.
-There is no way to push a second root, and no way to `finish` an empty
-document.
+> The builder API uses *typestate* to enforce one root container at compile time.
 
-Nested builders close themselves on `Drop`; call `.end()` to surface
-errors rather than swallow them into the writer's poison flag. Root
-builders carry `#[must_use]`, so dropping one without `.end()`
-triggers a lint - without `.end()` the writer is lost and the document
-is left without a trailer.
+### Advanced Use Cases
+
+For more advanced use cases, we have the `raw::RawWriter`. Mismatched frames and stray keys surface as runtime
+errors instead.
+
+```rust
+use kahon::raw::RawWriter;
+
+let mut buf: Vec<u8> = Vec::new();
+let mut w = RawWriter::new(&mut buf);
+
+w.begin_object()?;
+w.push_key("hp")?;
+w.push_i64(80)?;
+w.push_key("enraged")?;
+w.push_bool(true)?;
+
+w.push_key("weapons")?;
+w.begin_array()?;
+w.push_str("fist")?;
+w.begin_object()?;
+w.push_key("name")?;
+w.push_str("great axe")?;
+w.push_key("damage")?;
+w.push_i64(15)?;
+w.end_object()?;
+w.end_array()?;
+
+w.end_object()?;
+w.finish()?;
+```
+
+## Features
+
+- **Memory Friendly**: Memory can stay bounded by how deep your JSON is, not document size.
+- **Fast Value Retrieval**: Similar to SQLite, arrays and objects are stored as B+trees: index into a million-element array, or look up a key in a million-key object, without scanning for the whole thing first.
+- **Tuneable**: There's a bunch of options to balance out memory usage and read performance to your liking.
 
 ## Tuning
 
@@ -70,7 +93,7 @@ The default (`BuildPolicy::compact(128)`) produces the tightest output and is be
 
 ## Status
 
-Pre-1.0. The on-disk format is governed by an [external spec](https://github.com/jankdc/kahon); comments in the source cite section numbers. A reference reader lives under `tests/common/` and is exercised by the golden-file and property tests.
+Pre-1.0. Stuff is still moving and breaking quite a lot due to having to play with the API so there's no guarantee of stability at the moment. The on-disk format is governed by an [external spec](https://github.com/jankdc/kahon); comments in the source cite section numbers. A reference reader lives under `tests/common/` and is exercised by the golden-file and property tests.
 
 ## License
 
