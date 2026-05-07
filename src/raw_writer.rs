@@ -1,106 +1,187 @@
 //! Flat, runtime-checked writer surface for advanced integrations.
 //!
+//! `RawWriter` owns the writer's state and primitive operations; the
+//! safe, typestate-guarded builder API in [`Writer`](crate::Writer) is
+//! a thin newtype wrapper over it.
+//!
 //! Mismatched frames, forgotten closes, and `push_key` outside an
 //! object are runtime errors here. The builder API rules them out at
 //! compile time; the flat API trades that guarantee for composability.
-//!
-//! # Conversion
-//!
-//! [`Writer::into_raw`] consumes a `Writer` and returns a `RawWriter`
-//! over the same state. [`RawWriter::into_safe`] consumes the
-//! `RawWriter` back into a `Writer`. Open frames carry across
-//! conversion, so an adapter can drop into the builder API for a
-//! sub-tree and return without unwinding.
-//!
-//! Because conversion is by value, you cannot hold both surfaces over
-//! the same writer at once. Code that takes `&mut Writer` cannot
-//! accidentally call flat methods, and code that takes
-//! `&mut RawWriter` cannot accidentally open a builder.
-//!
-//! [`Writer`]: crate::Writer
-//! [`ArrayBuilder`]: crate::ArrayBuilder
-//! [`ObjectBuilder`]: crate::ObjectBuilder
-//! [`Writer::into_raw`]: crate::Writer::into_raw
 
+use crate::align::write_padding;
+use crate::bplus::ArrayBPlusBuilder;
 use crate::checkpoint::TrailerSnapshot;
+use crate::config::{PageAlignment, WriterOptions};
+use crate::encode::{write_f64, write_false, write_integer, write_null, write_string, write_true};
 use crate::error::WriteError;
-use crate::frame::Frame;
-use crate::sink::{RewindableSink, Sink};
-use crate::writer::Writer;
+use crate::frame::{close_frame, Frame, ObjectState};
+use crate::sink::{Sink, WriteCtx};
+use crate::types::{FLAGS, MAGIC, VERSION};
 
-/// Save-state for [`RawWriter`] backtracking.
+/// Flat, runtime-checked streaming writer over a [`Sink`].
 ///
-/// Maps directly onto the closure-shaped [`Writer::try_write`] used by
-/// the safe API.
-///
-/// [`Writer::try_write`]: crate::Writer::try_write
-pub struct Checkpoint(crate::checkpoint::Checkpoint);
-
+/// `RawWriter` is the lower-level surface: it holds the document state
+/// and exposes a flat API.
+/// 
+/// Most users want [`Writer`] and its builders; reach for `RawWriter`
+/// when you need a flat API for FFI bridges, async stream parsers, or
+/// storage-engine adapters.
 pub struct RawWriter<S: Sink> {
-    inner: Writer<S>,
+    pub(crate) sink: S,
+    pub(crate) pos: u64,
+    scratch: Vec<u8>,
+    pub(crate) padding_written: u64,
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) opts: WriterOptions,
+    pub(crate) root_offset: Option<u64>,
+    pub(crate) poisoned: bool,
 }
 
 impl<S: Sink> RawWriter<S> {
-    /// Promote a [`Writer`] to its flat form. The builder API becomes
-    /// unavailable until [`into_safe`](Self::into_safe).
-    pub fn from_writer(w: Writer<S>) -> Self {
-        Self { inner: w }
+    /// Create a raw writer with default options ([`WriterOptions::default`]).
+    ///
+    /// The header is written eagerly; if that initial write fails, the
+    /// writer is poisoned and the error surfaces on the next operation.
+    pub fn new(sink: S) -> Self {
+        // Default policy is statically known-valid; unwrap is safe.
+        Self::with_options(sink, WriterOptions::default())
+            .expect("default WriterOptions must validate")
     }
 
-    /// Demote back to the safe builder API. Open frames are preserved;
-    /// the next operation must close them in LIFO order or
-    /// [`Writer::finish`] will reject with [`WriteError::Poisoned`] /
-    /// equivalent state.
-    pub fn into_safe(self) -> Writer<S> {
-        self.inner
+    /// Create a raw writer with caller-supplied [`WriterOptions`].
+    ///
+    /// Returns [`WriteError::InvalidOption`] if the policy is malformed
+    /// (fanout < 2, target bytes < 64, or non–power-of-two page size).
+    pub fn with_options(sink: S, opts: WriterOptions) -> Result<Self, WriteError> {
+        opts.policy.validate()?;
+        let mut w = Self {
+            sink,
+            pos: 0,
+            scratch: Vec::with_capacity(64),
+            padding_written: 0,
+            frames: Vec::new(),
+            opts,
+            root_offset: None,
+            poisoned: false,
+        };
+        // If the header write fails, defer the error: poison now and surface
+        // it on the first push/finish.
+        if w.write_header().is_err() {
+            w.poisoned = true;
+        }
+        Ok(w)
+    }
+
+    /// Total bytes emitted to the sink so far, including the header,
+    /// every flushed value/node, and any alignment padding.
+    pub fn bytes_written(&self) -> u64 {
+        self.pos
+    }
+
+    /// Approximate live in-memory footprint of the writer's working buffers:
+    /// the scratch encoding buffer, plus per-frame B+tree buffers and object
+    /// run state. Useful for profiling peak memory across configurations.
+    pub fn buffered_bytes(&self) -> usize {
+        let mut total = self.scratch.capacity();
+        total += self.frames.capacity() * std::mem::size_of::<Frame>();
+        for f in &self.frames {
+            total += match f {
+                Frame::Array(b) => b.buffered_bytes(),
+                Frame::Object(o) => {
+                    let mut t =
+                        o.current_run.capacity() * std::mem::size_of::<(Vec<u8>, u64, u64)>();
+                    t += o.current_run_key_bytes;
+                    t += o.runs_cascade.buffered_bytes();
+                    if let Some((kb, _)) = &o.pending_key {
+                        t += kb.capacity();
+                    }
+                    t
+                }
+            };
+        }
+        total
+    }
+
+    /// Total bytes of unreferenced filler emitted by the page-alignment
+    /// policy (zero when [`PageAlignment::None`] is in effect). Useful for
+    /// quantifying the cost of disk-friendly layout.
+    pub fn padding_bytes_written(&self) -> u64 {
+        self.padding_written
     }
 
     // ------------------------------------------------------------------
-    // Scalars - delegate to Writer; semantics identical.
+    // Scalars
     // ------------------------------------------------------------------
 
-    /// See [`Writer::push_null`](crate::Writer::push_null).
+    /// Push a `null` as the document root, or as the next array
+    /// element / object value.
     pub fn push_null(&mut self) -> Result<(), WriteError> {
-        self.inner.push_null()
+        self.check_ready()?;
+        let off = self.emit_scalar(|b| {
+            write_null(b);
+            Ok(())
+        })?;
+        self.register_value(off)
     }
 
-    /// See [`Writer::push_bool`](crate::Writer::push_bool).
+    /// Push a boolean.
     pub fn push_bool(&mut self, v: bool) -> Result<(), WriteError> {
-        self.inner.push_bool(v)
+        self.check_ready()?;
+        let off = self.emit_scalar(|b| {
+            if v {
+                write_true(b);
+            } else {
+                write_false(b);
+            }
+            Ok(())
+        })?;
+        self.register_value(off)
     }
 
-    /// See [`Writer::push_i64`](crate::Writer::push_i64).
+    /// Push a signed 64-bit integer. Encoded in the narrowest tag that
+    /// fits the value.
     pub fn push_i64(&mut self, v: i64) -> Result<(), WriteError> {
-        self.inner.push_i64(v)
+        self.check_ready()?;
+        let off = self.emit_scalar(|b| write_integer(b, v as i128))?;
+        self.register_value(off)
     }
 
-    /// See [`Writer::push_u64`](crate::Writer::push_u64).
+    /// Push an unsigned 64-bit integer. Values up to `2^64 - 1` are
+    /// representable; encoded in the narrowest tag that fits.
     pub fn push_u64(&mut self, v: u64) -> Result<(), WriteError> {
-        self.inner.push_u64(v)
+        self.check_ready()?;
+        let off = self.emit_scalar(|b| write_integer(b, v as i128))?;
+        self.register_value(off)
     }
 
-    /// See [`Writer::push_f64`](crate::Writer::push_f64).
+    /// Push a 64-bit float.
+    ///
+    /// Returns [`WriteError::NaNOrInfinity`] for NaN or ±∞.
     pub fn push_f64(&mut self, v: f64) -> Result<(), WriteError> {
-        self.inner.push_f64(v)
+        self.check_ready()?;
+        let off = self.emit_scalar(|b| write_f64(b, v))?;
+        self.register_value(off)
     }
 
-    /// See [`Writer::push_str`](crate::Writer::push_str).
+    /// Push a UTF-8 string. The bytes are written as-is; no escaping is
+    /// applied.
     pub fn push_str(&mut self, s: &str) -> Result<(), WriteError> {
-        self.inner.push_str(s)
+        self.check_ready()?;
+        let off = self.emit_scalar(|b| {
+            write_string(b, s);
+            Ok(())
+        })?;
+        self.register_value(off)
     }
-
-    // ------------------------------------------------------------------
-    // Frames - the new flat surface.
-    // ------------------------------------------------------------------
 
     /// Open an array frame. Pair with [`end_array`](Self::end_array).
     ///
     /// Returns [`WriteError::Poisoned`] if the writer is poisoned.
     pub fn begin_array(&mut self) -> Result<(), WriteError> {
-        if self.inner.poisoned {
+        if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        self.inner.push_array_frame();
+        self.push_array_frame();
         Ok(())
     }
 
@@ -111,11 +192,11 @@ impl<S: Sink> RawWriter<S> {
     /// - [`WriteError::FrameMismatch`] if the top frame is not an
     ///   array (or no frame is open).
     pub fn end_array(&mut self) -> Result<(), WriteError> {
-        if self.inner.poisoned {
+        if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        match self.inner.frames.last() {
-            Some(Frame::Array(_)) => self.inner.close_array_frame(),
+        match self.frames.last() {
+            Some(Frame::Array(_)) => self.close_array_frame(),
             _ => Err(WriteError::FrameMismatch),
         }
     }
@@ -125,10 +206,10 @@ impl<S: Sink> RawWriter<S> {
     ///
     /// Returns [`WriteError::Poisoned`] if the writer is poisoned.
     pub fn begin_object(&mut self) -> Result<(), WriteError> {
-        if self.inner.poisoned {
+        if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        self.inner.push_object_frame();
+        self.push_object_frame();
         Ok(())
     }
 
@@ -139,11 +220,11 @@ impl<S: Sink> RawWriter<S> {
     /// - [`WriteError::FrameMismatch`] if the top frame is not an
     ///   object (or no frame is open).
     pub fn end_object(&mut self) -> Result<(), WriteError> {
-        if self.inner.poisoned {
+        if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        match self.inner.frames.last() {
-            Some(Frame::Object(_)) => self.inner.close_object_frame(),
+        match self.frames.last() {
+            Some(Frame::Object(_)) => self.close_object_frame(),
             _ => Err(WriteError::FrameMismatch),
         }
     }
@@ -155,61 +236,188 @@ impl<S: Sink> RawWriter<S> {
     /// - [`WriteError::KeyOutsideObject`] if the top frame is not an
     ///   object.
     pub fn push_key(&mut self, key: &str) -> Result<(), WriteError> {
-        if self.inner.poisoned {
+        if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        match self.inner.frames.last() {
-            Some(Frame::Object(_)) => self.inner.set_pending_key(key),
+        match self.frames.last() {
+            Some(Frame::Object(_)) => self.set_pending_key(key),
             _ => Err(WriteError::KeyOutsideObject),
         }
     }
 
     // ------------------------------------------------------------------
-    // Introspection - delegates.
+    // Finalization
     // ------------------------------------------------------------------
 
-    /// See [`Writer::bytes_written`](crate::Writer::bytes_written).
-    pub fn bytes_written(&self) -> u64 {
-        self.inner.bytes_written()
+    /// Finalize the document by writing the 12-byte trailer and return
+    /// the underlying sink.
+    ///
+    /// Errors if the writer is poisoned, has open container frames, or
+    /// never received a root value ([`WriteError::EmptyDocument`]).
+    pub fn finish(mut self) -> Result<S, WriteError> {
+        if self.poisoned {
+            return Err(WriteError::Poisoned);
+        }
+        if !self.frames.is_empty() {
+            self.poisoned = true;
+            return Err(WriteError::Poisoned);
+        }
+        let root = self.root_offset.ok_or(WriteError::EmptyDocument)?;
+
+        // Pad so the 12-byte trailer ends on a page boundary.
+        if let PageAlignment::Aligned { page_size } = self.opts.policy.align {
+            let ps = page_size as u64;
+            let target_mod = ps - 12;
+            let cur_mod = self.pos % ps;
+            let pad = if cur_mod <= target_mod {
+                target_mod - cur_mod
+            } else {
+                ps - cur_mod + target_mod
+            };
+            if pad > 0 {
+                let mut ctx = WriteCtx {
+                    sink: &mut self.sink,
+                    pos: &mut self.pos,
+                    scratch: &mut self.scratch,
+                    padding_written: &mut self.padding_written,
+                };
+                write_padding(&mut ctx, pad as usize)?;
+            }
+        }
+
+        let mut trailer = [0u8; 12];
+        trailer[..8].copy_from_slice(&root.to_le_bytes());
+        trailer[8..].copy_from_slice(&MAGIC);
+        self.sink.write_all(&trailer)?;
+        self.pos += trailer.len() as u64;
+        Ok(self.sink)
     }
 
-    /// See [`Writer::buffered_bytes`](crate::Writer::buffered_bytes).
-    pub fn buffered_bytes(&self) -> usize {
-        self.inner.buffered_bytes()
+    // ------------------------------------------------------------------
+    // Frame primitives - shared with the builder API.
+    // ------------------------------------------------------------------
+
+    pub(crate) fn push_array_frame(&mut self) {
+        self.frames.push(Frame::Array(ArrayBPlusBuilder::new()));
     }
 
-    /// See [`Writer::padding_bytes_written`](crate::Writer::padding_bytes_written).
-    pub fn padding_bytes_written(&self) -> u64 {
-        self.inner.padding_bytes_written()
+    pub(crate) fn push_object_frame(&mut self) {
+        self.frames.push(Frame::Object(ObjectState::default()));
     }
+
+    pub(crate) fn set_pending_key(&mut self, key: &str) -> Result<(), WriteError> {
+        let off = self.emit_scalar(|b| {
+            write_string(b, key);
+            Ok(())
+        })?;
+        match self.frames.last_mut() {
+            Some(Frame::Object(o)) => {
+                o.set_pending_key(key.as_bytes().to_vec(), off);
+                Ok(())
+            }
+            _ => unreachable!(
+                "set_pending_key is pub(crate) and only called from ObjectBuilder \
+                 with an Object frame on top"
+            ),
+        }
+    }
+
+    pub(crate) fn close_array_frame(&mut self) -> Result<(), WriteError> {
+        if self.poisoned {
+            return Err(WriteError::Poisoned);
+        }
+        let Some(frame @ Frame::Array(_)) = self.frames.pop() else {
+            unreachable!("top frame is not an array")
+        };
+        let mut ctx = WriteCtx {
+            sink: &mut self.sink,
+            pos: &mut self.pos,
+            scratch: &mut self.scratch,
+            padding_written: &mut self.padding_written,
+        };
+        let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
+        self.register_value(root_off)
+    }
+
+    pub(crate) fn close_object_frame(&mut self) -> Result<(), WriteError> {
+        if self.poisoned {
+            return Err(WriteError::Poisoned);
+        }
+        let Some(frame @ Frame::Object(_)) = self.frames.pop() else {
+            unreachable!("top frame is not an object")
+        };
+        let mut ctx = WriteCtx {
+            sink: &mut self.sink,
+            pos: &mut self.pos,
+            scratch: &mut self.scratch,
+            padding_written: &mut self.padding_written,
+        };
+        let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
+        self.register_value(root_off)
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot
+    // ------------------------------------------------------------------
 
     /// See [`Writer::snapshot_trailer`](crate::Writer::snapshot_trailer).
     pub fn snapshot_trailer(&self) -> Result<TrailerSnapshot, WriteError> {
-        self.inner.snapshot_trailer()
+        crate::checkpoint::snapshot_trailer(self)
     }
 
-    /// See [`Writer::finish`](crate::Writer::finish). Errors if any
-    /// frame is still open.
-    pub fn finish(self) -> Result<S, WriteError> {
-        self.inner.finish()
-    }
-}
+    // ------------------------------------------------------------------
+    // Internals
+    // ------------------------------------------------------------------
 
-impl<S: RewindableSink> RawWriter<S> {
-    /// Capture a save-state for speculative writes. Cheap;
-    /// non-mutating. Pair with [`rollback`](Self::rollback) to revert,
-    /// or drop the [`Checkpoint`] to commit.
-    pub fn checkpoint(&self) -> Checkpoint {
-        Checkpoint(self.inner.checkpoint())
+    fn write_header(&mut self) -> Result<(), WriteError> {
+        let header = [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], VERSION, FLAGS];
+        self.sink.write_all(&header)?;
+        self.pos += header.len() as u64;
+        Ok(())
     }
 
-    /// Restore the writer to the captured save-state. Truncates the
-    /// sink, restores the frame stack, and clears the poison flag if
-    /// it was clean at capture time.
-    ///
-    /// Errors with [`WriteError::Io`] if the sink truncate fails; the
-    /// writer is poisoned in that case.
-    pub fn rollback(&mut self, cp: Checkpoint) -> Result<(), WriteError> {
-        self.inner.rollback(cp.0)
+    fn check_ready(&self) -> Result<(), WriteError> {
+        if self.poisoned {
+            return Err(WriteError::Poisoned);
+        }
+        Ok(())
+    }
+
+    /// Serialize a scalar into `scratch` and emit it via callback.
+    /// Returns the offset where the value's tag byte was written.
+    fn emit_scalar(
+        &mut self,
+        build: impl FnOnce(&mut Vec<u8>) -> Result<(), WriteError>,
+    ) -> Result<u64, WriteError> {
+        self.scratch.clear();
+        build(&mut self.scratch)?;
+        let off = self.pos;
+        self.sink.write_all(&self.scratch)?;
+        self.pos += self.scratch.len() as u64;
+        Ok(off)
+    }
+
+    /// Route a completed value's offset to the current context: the root slot,
+    /// an open array frame, or an open object frame awaiting a key.
+    fn register_value(&mut self, off: u64) -> Result<(), WriteError> {
+        let run_buffer = self.opts.object_sort_window;
+        let policy = &self.opts.policy;
+        let mut ctx = WriteCtx {
+            sink: &mut self.sink,
+            pos: &mut self.pos,
+            scratch: &mut self.scratch,
+            padding_written: &mut self.padding_written,
+        };
+        match self.frames.last_mut() {
+            None => {
+                if self.root_offset.is_some() {
+                    return Err(WriteError::MultipleRootValues);
+                }
+                self.root_offset = Some(off);
+                Ok(())
+            }
+            Some(Frame::Array(a)) => a.push(off, policy, &mut ctx),
+            Some(Frame::Object(o)) => o.accept_value(off, run_buffer, policy, &mut ctx),
+        }
     }
 }

@@ -32,9 +32,9 @@ fn integer_width_selection() {
     for &(v, tag) in cases {
         let buf = build(|w| {
             if v >= 0 {
-                w.push_u64(v as u64).unwrap();
+                w.push_u64(v as u64).unwrap()
             } else {
-                w.push_i64(v as i64).unwrap();
+                w.push_i64(v as i64).unwrap()
             }
         });
         assert_eq!(root_byte(&buf), tag, "value {} expected tag {:#x}", v, tag);
@@ -46,14 +46,14 @@ fn integer_range_boundaries_accepted() {
     // integer range is [-2^63, 2^64-1]. Both endpoints must encode.
     for &v in &[u64::MAX, 0, i64::MAX as u64] {
         let mut buf = Vec::new();
-        let mut w = Writer::new(&mut buf);
-        w.push_u64(v).unwrap();
+        let w = Writer::new(&mut buf);
+        let w = w.push_u64(v).unwrap();
         w.finish().unwrap();
     }
     for &v in &[i64::MIN, -1, 0, i64::MAX] {
         let mut buf = Vec::new();
-        let mut w = Writer::new(&mut buf);
-        w.push_i64(v).unwrap();
+        let w = Writer::new(&mut buf);
+        let w = w.push_i64(v).unwrap();
         w.finish().unwrap();
     }
 }
@@ -109,7 +109,7 @@ fn float_negative_zero_preserved_as_f32() {
 #[test]
 fn float_nan_rejected() {
     let mut buf = Vec::new();
-    let mut w = Writer::new(&mut buf);
+    let w = Writer::new(&mut buf);
     assert!(matches!(
         w.push_f64(f64::NAN),
         Err(WriteError::NaNOrInfinity)
@@ -118,16 +118,11 @@ fn float_nan_rejected() {
 
 #[test]
 fn float_infinity_rejected() {
-    let mut buf = Vec::new();
-    let mut w = Writer::new(&mut buf);
-    assert!(matches!(
-        w.push_f64(f64::INFINITY),
-        Err(WriteError::NaNOrInfinity)
-    ));
-    assert!(matches!(
-        w.push_f64(f64::NEG_INFINITY),
-        Err(WriteError::NaNOrInfinity)
-    ));
+    for v in [f64::INFINITY, f64::NEG_INFINITY] {
+        let mut buf = Vec::new();
+        let w = Writer::new(&mut buf);
+        assert!(matches!(w.push_f64(v), Err(WriteError::NaNOrInfinity)));
+    }
 }
 
 #[test]

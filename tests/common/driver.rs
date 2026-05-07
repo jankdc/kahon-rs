@@ -2,20 +2,23 @@
 //! distinction is taken from `serde_json::Number`, which preserves the
 //! source token's classification (presence of `.` or `e`/`E`).
 
-use kahon::{ArrayBuilder, ObjectBuilder, WriteError, Writer, WriterOptions};
+use kahon::{ArrayBuilder, Empty, Filled, ObjectBuilder, Sink, WriteError, Writer, WriterOptions};
 use serde_json::{Number, Value};
 
 pub fn encode(value: &Value, opts: WriterOptions) -> Result<Vec<u8>, WriteError> {
     let mut buf = Vec::new();
     {
-        let mut w = Writer::with_options(&mut buf, opts)?;
-        write_value(&mut w, value)?;
+        let w = Writer::with_options(&mut buf, opts)?;
+        let w = write_root(w, value)?;
         w.finish()?;
     }
     Ok(buf)
 }
 
-fn write_value<S: kahon::Sink>(w: &mut Writer<S>, value: &Value) -> Result<(), WriteError> {
+fn write_root<S: Sink>(
+    w: Writer<S, Empty>,
+    value: &Value,
+) -> Result<Writer<S, Filled>, WriteError> {
     match value {
         Value::Null => w.push_null(),
         Value::Bool(b) => w.push_bool(*b),
@@ -24,24 +27,90 @@ fn write_value<S: kahon::Sink>(w: &mut Writer<S>, value: &Value) -> Result<(), W
         Value::Array(items) => {
             let mut a = w.start_array();
             for item in items {
-                write_in_array(&mut a, item)?;
+                write_in_array_root(&mut a, item)?;
             }
             a.end()
         }
         Value::Object(map) => {
             let mut o = w.start_object();
             for (k, v) in map {
-                write_in_object(&mut o, k, v)?;
+                write_in_object_root(&mut o, k, v)?;
             }
             o.end()
         }
     }
 }
 
-fn write_in_array<S: kahon::Sink>(
-    a: &mut ArrayBuilder<'_, S>,
+fn write_in_array_root<S: Sink>(
+    a: &mut kahon::RootArrayBuilder<S>,
     value: &Value,
 ) -> Result<(), WriteError> {
+    // Same shape as `write_in_array`, just with the root variant of the
+    // outer builder. Nested children come back as the regular
+    // `ArrayBuilder` / `ObjectBuilder`, so recursion uses the non-root
+    // helpers.
+    match value {
+        Value::Null => a.push_null(),
+        Value::Bool(b) => a.push_bool(*b),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.to_string()) {
+            (Some(i), _, ref s) if !s.contains('.') && !s.contains(['e', 'E']) => a.push_i64(i),
+            (_, Some(u), ref s) if !s.contains('.') && !s.contains(['e', 'E']) => a.push_u64(u),
+            _ => a.push_f64(n.as_f64().expect("f64")),
+        },
+        Value::String(s) => a.push_str(s),
+        Value::Array(items) => {
+            let mut nested = a.start_array();
+            for item in items {
+                write_in_array(&mut nested, item)?;
+            }
+            nested.end()
+        }
+        Value::Object(map) => {
+            let mut nested = a.start_object();
+            for (k, v) in map {
+                write_in_object(&mut nested, k, v)?;
+            }
+            nested.end()
+        }
+    }
+}
+
+fn write_in_object_root<S: Sink>(
+    o: &mut kahon::RootObjectBuilder<S>,
+    key: &str,
+    value: &Value,
+) -> Result<(), WriteError> {
+    match value {
+        Value::Null => o.push_null(key),
+        Value::Bool(b) => o.push_bool(key, *b),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.to_string()) {
+            (Some(i), _, ref s) if !s.contains('.') && !s.contains(['e', 'E']) => {
+                o.push_i64(key, i)
+            }
+            (_, Some(u), ref s) if !s.contains('.') && !s.contains(['e', 'E']) => {
+                o.push_u64(key, u)
+            }
+            _ => o.push_f64(key, n.as_f64().expect("f64")),
+        },
+        Value::String(s) => o.push_str(key, s),
+        Value::Array(items) => {
+            let mut nested = o.start_array(key)?;
+            for item in items {
+                write_in_array(&mut nested, item)?;
+            }
+            nested.end()
+        }
+        Value::Object(map) => {
+            let mut nested = o.start_object(key)?;
+            for (k, v) in map {
+                write_in_object(&mut nested, k, v)?;
+            }
+            nested.end()
+        }
+    }
+}
+
+fn write_in_array<S: Sink>(a: &mut ArrayBuilder<'_, S>, value: &Value) -> Result<(), WriteError> {
     match value {
         Value::Null => a.push_null(),
         Value::Bool(b) => a.push_bool(*b),
@@ -64,7 +133,7 @@ fn write_in_array<S: kahon::Sink>(
     }
 }
 
-fn write_in_object<S: kahon::Sink>(
+fn write_in_object<S: Sink>(
     o: &mut ObjectBuilder<'_, S>,
     key: &str,
     value: &Value,
@@ -91,14 +160,17 @@ fn write_in_object<S: kahon::Sink>(
     }
 }
 
-fn write_number_root<S: kahon::Sink>(w: &mut Writer<S>, n: &Number) -> Result<(), WriteError> {
-    if let Some(i) = n.as_i64() {
-        if !n.to_string().contains('.') && !n.to_string().contains(['e', 'E']) {
+fn write_number_root<S: Sink>(
+    w: Writer<S, Empty>,
+    n: &Number,
+) -> Result<Writer<S, Filled>, WriteError> {
+    let s = n.to_string();
+    let is_float = s.contains('.') || s.contains(['e', 'E']);
+    if !is_float {
+        if let Some(i) = n.as_i64() {
             return w.push_i64(i);
         }
-    }
-    if let Some(u) = n.as_u64() {
-        if !n.to_string().contains('.') && !n.to_string().contains(['e', 'E']) {
+        if let Some(u) = n.as_u64() {
             return w.push_u64(u);
         }
     }
@@ -108,7 +180,7 @@ fn write_number_root<S: kahon::Sink>(w: &mut Writer<S>, n: &Number) -> Result<()
     w.push_f64(f)
 }
 
-fn write_number_in_array<S: kahon::Sink>(
+fn write_number_in_array<S: Sink>(
     a: &mut ArrayBuilder<'_, S>,
     n: &Number,
 ) -> Result<(), WriteError> {
@@ -128,7 +200,7 @@ fn write_number_in_array<S: kahon::Sink>(
     )
 }
 
-fn write_number_in_object<S: kahon::Sink>(
+fn write_number_in_object<S: Sink>(
     o: &mut ObjectBuilder<'_, S>,
     key: &str,
     n: &Number,

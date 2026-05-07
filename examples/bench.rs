@@ -93,28 +93,106 @@ fn build_big_object_fat(n_keys: usize) -> Value {
 // Writer drivers (recursive over serde_json::Value)
 // ============================================================================
 
-fn write_root(w: &mut Writer<&mut Vec<u8>>, v: &Value, peak: &mut usize) {
-    match v {
+fn write_root<'a>(
+    w: Writer<&'a mut Vec<u8>, kahon::Empty>,
+    v: &Value,
+    peak: &mut usize,
+) -> Writer<&'a mut Vec<u8>, kahon::Filled> {
+    let w = match v {
         Value::Array(items) => {
             let mut b = w.start_array();
             for item in items {
-                push_into_array(&mut b, item, peak);
+                push_into_root_array(&mut b, item, peak);
             }
-            b.end().unwrap();
+            b.end().unwrap()
         }
         Value::Object(map) => {
             let mut b = w.start_object();
             for (k, vv) in map {
-                push_into_object(&mut b, k, vv, peak);
+                push_into_root_object(&mut b, k, vv, peak);
             }
-            b.end().unwrap();
+            b.end().unwrap()
         }
         Value::Null => w.push_null().unwrap(),
         Value::Bool(x) => w.push_bool(*x).unwrap(),
         Value::String(s) => w.push_str(s).unwrap(),
         Value::Number(n) => push_number_root(w, n),
-    }
+    };
     *peak = (*peak).max(w.buffered_bytes());
+    w
+}
+
+fn push_into_root_array(
+    b: &mut kahon::RootArrayBuilder<&mut Vec<u8>>,
+    v: &Value,
+    peak: &mut usize,
+) {
+    match v {
+        Value::Array(items) => {
+            let mut inner = b.start_array();
+            for item in items {
+                push_into_array(&mut inner, item, peak);
+            }
+            inner.end().unwrap();
+        }
+        Value::Object(map) => {
+            let mut inner = b.start_object();
+            for (kk, vv) in map {
+                push_into_object(&mut inner, kk, vv, peak);
+            }
+            inner.end().unwrap();
+        }
+        Value::Null => b.push_null().unwrap(),
+        Value::Bool(x) => b.push_bool(*x).unwrap(),
+        Value::String(s) => b.push_str(s).unwrap(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                b.push_i64(i).unwrap();
+            } else if let Some(u) = n.as_u64() {
+                b.push_u64(u).unwrap();
+            } else {
+                b.push_f64(n.as_f64().unwrap()).unwrap();
+            }
+        }
+    }
+    *peak = (*peak).max(b.buffered_bytes());
+}
+
+fn push_into_root_object(
+    b: &mut kahon::RootObjectBuilder<&mut Vec<u8>>,
+    k: &str,
+    v: &Value,
+    peak: &mut usize,
+) {
+    match v {
+        Value::Array(items) => {
+            let mut inner = b.start_array(k).unwrap();
+            for item in items {
+                push_into_array(&mut inner, item, peak);
+            }
+            inner.end().unwrap();
+        }
+        Value::Object(map) => {
+            let mut inner = b.start_object(k).unwrap();
+            for (kk, vv) in map {
+                push_into_object(&mut inner, kk, vv, peak);
+            }
+            inner.end().unwrap();
+        }
+        Value::Null => b.push_null(k).unwrap(),
+        Value::Bool(x) => b.push_bool(k, *x).unwrap(),
+        Value::String(s) => b.push_str(k, s).unwrap(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                b.push_i64(k, i).unwrap();
+            } else if let Some(u) = n.as_u64() {
+                b.push_u64(k, u).unwrap();
+            } else {
+                b.push_f64(k, n.as_f64().unwrap()).unwrap();
+            }
+        }
+    }
+    *peak = (*peak).max(b.buffered_bytes());
 }
 
 fn push_into_array(b: &mut ArrayBuilder<'_, &mut Vec<u8>>, v: &Value, peak: &mut usize) {
@@ -181,13 +259,16 @@ fn push_into_object(b: &mut ObjectBuilder<'_, &mut Vec<u8>>, k: &str, v: &Value,
     *peak = (*peak).max(b.buffered_bytes());
 }
 
-fn push_number_root(w: &mut Writer<&mut Vec<u8>>, n: &serde_json::Number) {
+fn push_number_root<'a>(
+    w: Writer<&'a mut Vec<u8>, kahon::Empty>,
+    n: &serde_json::Number,
+) -> Writer<&'a mut Vec<u8>, kahon::Filled> {
     if let Some(i) = n.as_i64() {
-        w.push_i64(i).unwrap();
+        w.push_i64(i).unwrap()
     } else if let Some(u) = n.as_u64() {
-        w.push_u64(u).unwrap();
+        w.push_u64(u).unwrap()
     } else {
-        w.push_f64(n.as_f64().unwrap()).unwrap();
+        w.push_f64(n.as_f64().unwrap()).unwrap()
     }
 }
 
@@ -214,9 +295,9 @@ fn run_one(
 
     let t = Instant::now();
     {
-        let mut w = Writer::with_options(&mut buf, opts).expect("valid options");
+        let w = Writer::with_options(&mut buf, opts).expect("valid options");
         peak = peak.max(w.buffered_bytes());
-        write_root(&mut w, doc, &mut peak);
+        let w = write_root(w, doc, &mut peak);
         w.finish().unwrap();
     }
     let write = t.elapsed();

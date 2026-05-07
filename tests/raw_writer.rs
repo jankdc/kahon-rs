@@ -1,4 +1,4 @@
-//! Tests for the flat `RawWriter` API and `Writer` <-> `RawWriter` conversion.
+//! Tests for the flat `RawWriter` API.
 
 mod common;
 
@@ -11,30 +11,28 @@ use serde_json::json;
 fn flat_matches_builder_byte_for_byte() {
     let mut buf_builder: Vec<u8> = Vec::new();
     {
-        let mut w = Writer::new(&mut buf_builder);
+        let w = Writer::new(&mut buf_builder);
+        let mut o = w.start_object();
+        o.push_i64("hp", 80).unwrap();
+        o.push_bool("enraged", true).unwrap();
         {
-            let mut o = w.start_object();
-            o.push_i64("hp", 80).unwrap();
-            o.push_bool("enraged", true).unwrap();
+            let mut a = o.start_array("weapons").unwrap();
+            a.push_str("fist").unwrap();
             {
-                let mut a = o.start_array("weapons").unwrap();
-                a.push_str("fist").unwrap();
-                {
-                    let mut inner = a.start_object();
-                    inner.push_str("name", "great axe").unwrap();
-                    inner.push_i64("damage", 15).unwrap();
-                    inner.end().unwrap();
-                }
-                a.end().unwrap();
+                let mut inner = a.start_object();
+                inner.push_str("name", "great axe").unwrap();
+                inner.push_i64("damage", 15).unwrap();
+                inner.end().unwrap();
             }
-            o.end().unwrap();
+            a.end().unwrap();
         }
+        let w = o.end().unwrap();
         w.finish().unwrap();
     }
 
     let mut buf_flat: Vec<u8> = Vec::new();
     {
-        let mut r = RawWriter::from_writer(Writer::new(&mut buf_flat));
+        let mut r = RawWriter::new(&mut buf_flat);
         r.begin_object().unwrap();
         r.push_key("hp").unwrap();
         r.push_i64(80).unwrap();
@@ -67,30 +65,9 @@ fn flat_matches_builder_byte_for_byte() {
 }
 
 #[test]
-fn round_trip_preserves_open_frames() {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
-    r.begin_object().unwrap();
-    r.push_key("outer").unwrap();
-    r.begin_array().unwrap();
-    r.push_i64(1).unwrap();
-
-    // Hand back to the safe API mid-document; open frames must carry across.
-    let w = r.into_safe();
-    let mut r = w.into_raw();
-    r.push_i64(2).unwrap();
-    r.end_array().unwrap();
-    r.end_object().unwrap();
-    r.finish().unwrap();
-
-    let decoded = reader::decode(&buf).unwrap().value;
-    assert_eq!(decoded, json!({ "outer": [1, 2] }));
-}
-
-#[test]
 fn end_array_when_object_open_errors() {
     let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
+    let mut r = RawWriter::new(&mut buf);
     r.begin_object().unwrap();
     let err = r.end_array().unwrap_err();
     assert!(matches!(err, WriteError::FrameMismatch));
@@ -99,7 +76,7 @@ fn end_array_when_object_open_errors() {
 #[test]
 fn end_object_when_array_open_errors() {
     let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
+    let mut r = RawWriter::new(&mut buf);
     r.begin_array().unwrap();
     let err = r.end_object().unwrap_err();
     assert!(matches!(err, WriteError::FrameMismatch));
@@ -108,7 +85,7 @@ fn end_object_when_array_open_errors() {
 #[test]
 fn end_array_with_no_open_frame_errors() {
     let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
+    let mut r = RawWriter::new(&mut buf);
     let err = r.end_array().unwrap_err();
     assert!(matches!(err, WriteError::FrameMismatch));
 }
@@ -116,7 +93,7 @@ fn end_array_with_no_open_frame_errors() {
 #[test]
 fn push_key_outside_object_errors() {
     let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
+    let mut r = RawWriter::new(&mut buf);
     let err = r.push_key("nope").unwrap_err();
     assert!(matches!(err, WriteError::KeyOutsideObject));
 
@@ -128,7 +105,7 @@ fn push_key_outside_object_errors() {
 #[test]
 fn rollback_reverts_speculative_writes() {
     let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
+    let mut r = RawWriter::new(&mut buf);
     r.begin_array().unwrap();
     r.push_i64(1).unwrap();
 
@@ -148,7 +125,7 @@ fn rollback_reverts_speculative_writes() {
 #[test]
 fn rollback_reverts_open_frame() {
     let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
+    let mut r = RawWriter::new(&mut buf);
     r.begin_object().unwrap();
     r.push_key("kept").unwrap();
     r.push_i64(1).unwrap();
@@ -171,8 +148,8 @@ fn rollback_reverts_open_frame() {
 }
 
 #[test]
-fn rollback_matches_try_write_semantics() {
-    // Same speculative work, one via try_write on Writer, one via
+fn rollback_matches_builder_try_write_semantics() {
+    // Same speculative work, one via `try_write` on a builder, one via
     // checkpoint/rollback on RawWriter. Bytes must match.
     #[derive(Debug)]
     struct MyErr;
@@ -184,7 +161,7 @@ fn rollback_matches_try_write_semantics() {
 
     let mut buf_a: Vec<u8> = Vec::new();
     {
-        let mut w = Writer::new(&mut buf_a);
+        let w = Writer::new(&mut buf_a);
         let mut a = w.start_array();
         a.push_i64(1).unwrap();
         let _: Result<(), MyErr> = a.try_write(|a| {
@@ -192,13 +169,13 @@ fn rollback_matches_try_write_semantics() {
             Err(MyErr)
         });
         a.push_i64(2).unwrap();
-        a.end().unwrap();
+        let w = a.end().unwrap();
         w.finish().unwrap();
     }
 
     let mut buf_b: Vec<u8> = Vec::new();
     {
-        let mut r = Writer::new(&mut buf_b).into_raw();
+        let mut r = RawWriter::new(&mut buf_b);
         r.begin_array().unwrap();
         r.push_i64(1).unwrap();
         let cp = r.checkpoint();
@@ -215,15 +192,27 @@ fn rollback_matches_try_write_semantics() {
 }
 
 #[test]
-fn flat_inner_subtree_inside_builder_outer() {
-    // Outer: builder API. Inner: flat API. Verify byte-identical to all-builder.
-    let mut buf_mixed: Vec<u8> = Vec::new();
+fn raw_byte_for_byte_matches_builder() {
+    // Writing the same logical document via the builder API and the flat
+    // API must produce byte-identical output.
+    let mut buf_pure: Vec<u8> = Vec::new();
     {
-        let w = Writer::new(&mut buf_mixed);
-        // Open outer object via flat (since builders borrow), write a key,
-        // then keep writing in flat. Mixing is by-conversion only — inside
-        // a single flat span we stay flat.
-        let mut r = w.into_raw();
+        let w = Writer::new(&mut buf_pure);
+        let mut o = w.start_object();
+        o.push_i64("a", 1).unwrap();
+        {
+            let mut a = o.start_array("nested").unwrap();
+            a.push_i64(2).unwrap();
+            a.push_i64(3).unwrap();
+            a.end().unwrap();
+        }
+        let w = o.end().unwrap();
+        w.finish().unwrap();
+    }
+
+    let mut buf_raw: Vec<u8> = Vec::new();
+    {
+        let mut r = RawWriter::new(&mut buf_raw);
         r.begin_object().unwrap();
         r.push_key("a").unwrap();
         r.push_i64(1).unwrap();
@@ -236,30 +225,13 @@ fn flat_inner_subtree_inside_builder_outer() {
         r.finish().unwrap();
     }
 
-    let mut buf_pure: Vec<u8> = Vec::new();
-    {
-        let mut w = Writer::new(&mut buf_pure);
-        {
-            let mut o = w.start_object();
-            o.push_i64("a", 1).unwrap();
-            {
-                let mut a = o.start_array("nested").unwrap();
-                a.push_i64(2).unwrap();
-                a.push_i64(3).unwrap();
-                a.end().unwrap();
-            }
-            o.end().unwrap();
-        }
-        w.finish().unwrap();
-    }
-
-    assert_eq!(buf_mixed, buf_pure);
+    assert_eq!(buf_raw, buf_pure);
 }
 
 #[test]
 fn finish_with_open_frame_errors() {
     let mut buf: Vec<u8> = Vec::new();
-    let mut r = Writer::new(&mut buf).into_raw();
+    let mut r = RawWriter::new(&mut buf);
     r.begin_array().unwrap();
     r.push_i64(1).unwrap();
     // Don't close the array.

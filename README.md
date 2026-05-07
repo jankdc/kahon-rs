@@ -2,12 +2,12 @@
 
 A Rust writer for the [Kahon binary format](https://github.com/jankdc/kahon).
 
-## Goals
+## Features
 
 - Values are written as they arrive; containers reference children by back-offset. Memory stays bounded by tree depth, not document size.
 - Arrays and objects are B+trees on disk: index into a million-element array, or look up a key in a million-key object, without scanning.
 - Fixed-fanout for tight in-memory output, or page-aligned target-byte sizing for files that will be `pread`-ed or memory-mapped.
-- Uses flexbuffer-like builder pattern API to construct the JSON object.
+- Typestate builder API: "exactly one root value per document" is enforced at compile time, not at runtime.
 
 ## Usage
 
@@ -19,8 +19,9 @@ cargo add kahon
 use kahon::Writer;
 
 let mut buf: Vec<u8> = Vec::new();
-let mut w = Writer::new(&mut buf);
+let w = Writer::new(&mut buf);
 
+// `start_object` consumes the empty `Writer` and returns a root builder.
 let mut monster = w.start_object();
 monster.push_i64("hp", 80)?;
 monster.push_bool("enraged", true)?;
@@ -34,11 +35,23 @@ monster.push_bool("enraged", true)?;
     // axe and weapons auto-close on drop
 }
 
-monster.end()?; // explicit close propagates errors
-w.finish()?;    // writes the 12-byte trailer
+// `.end()` returns the writer in its `Filled` state, ready for `.finish()`.
+let w = monster.end()?;
+w.finish()?;
 ```
 
-Builders close themselves on `Drop`; use `.end()` when you want errors surfaced rather than swallowed into the writer's poison flag.
+The safe builder API uses *typestate* to enforce "exactly one root
+value per document" at compile time: `Writer<S, Empty>` exposes
+`push_*` and `start_*` (each consuming `self`), and
+`Writer<S, Filled>` exposes only `finish` and `snapshot_trailer`.
+There is no way to push a second root, and no way to `finish` an empty
+document.
+
+Nested builders close themselves on `Drop`; call `.end()` to surface
+errors rather than swallow them into the writer's poison flag. Root
+builders carry `#[must_use]`, so dropping one without `.end()`
+triggers a lint — without `.end()` the writer is lost and the document
+is left without a trailer.
 
 ## Tuning
 

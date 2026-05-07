@@ -66,12 +66,12 @@ fn aligned_writer_reports_padding_bytes() {
     let mut buf = Vec::new();
     let padding;
     {
-        let mut w = Writer::with_options(&mut buf, opts).unwrap();
+        let w = Writer::with_options(&mut buf, opts).unwrap();
         let mut a = w.start_array();
         for i in 0..2_000i64 {
             a.push_i64(i).unwrap();
         }
-        a.end().unwrap();
+        let w = a.end().unwrap();
         // Pre-finish: any padding inserted between nodes is reflected here.
         // After finish: trailer padding is also included.
         let pre = w.padding_bytes_written();
