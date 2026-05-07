@@ -99,10 +99,6 @@ impl<S: Sink> RawWriter<S> {
         self.padding_written
     }
 
-    // ------------------------------------------------------------------
-    // Scalars
-    // ------------------------------------------------------------------
-
     /// Push a `null` (root, array element, or object value).
     pub fn push_null(&mut self) -> Result<(), WriteError> {
         self.check_ready()?;
@@ -220,10 +216,6 @@ impl<S: Sink> RawWriter<S> {
             _ => Err(WriteError::KeyOutsideObject),
         }
     }
-
-    // ------------------------------------------------------------------
-    // Finalization
-    // ------------------------------------------------------------------
 
     /// Finalize the document and return the underlying sink.
     ///
