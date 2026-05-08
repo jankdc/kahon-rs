@@ -27,5 +27,5 @@ pub(crate) const ARRAY_LEAF_TAG: u8 = 0x70;
 pub(crate) const ARRAY_INTERNAL_TAG: u8 = 0x74;
 pub(crate) const OBJECT_LEAF_TAG: u8 = 0x80;
 pub(crate) const OBJECT_INTERNAL_TAG: u8 = 0x84;
-pub(crate) const TINY_SUM: u8 = 0xC0;
-pub(crate) const SUM: u8 = 0xD0;
+pub(crate) const TINY_EXT: u8 = 0xC0;
+pub(crate) const EXT: u8 = 0xD0;

@@ -9,7 +9,7 @@ use crate::align::write_padding;
 use crate::bplus::ArrayBPlusBuilder;
 use crate::config::{PageAlignment, WriterOptions};
 use crate::encode::{
-    write_f64, write_false, write_integer, write_null, write_string, write_sum, write_true,
+    write_ext, write_f64, write_false, write_integer, write_null, write_string, write_true,
 };
 use crate::error::WriteError;
 use crate::frame::{close_frame, Frame, ObjectState};
@@ -30,7 +30,7 @@ pub struct RawWriter<S: Sink> {
     pub(crate) opts: WriterOptions,
     pub(crate) root_offset: Option<u64>,
     pub(crate) poisoned: bool,
-    pub(crate) pending_sums: Vec<(u64, usize)>,
+    pub(crate) pending_exts: Vec<(u64, usize)>,
 }
 
 impl<S: Sink> RawWriter<S> {
@@ -59,7 +59,7 @@ impl<S: Sink> RawWriter<S> {
             opts,
             root_offset: None,
             poisoned: false,
-            pending_sums: Vec::new(),
+            pending_exts: Vec::new(),
         };
         // If the header write fails, defer the error: poison now and surface
         // it on the first push/finish.
@@ -160,27 +160,33 @@ impl<S: Sink> RawWriter<S> {
         self.register_value(off)
     }
 
-    /// Open a sum wrapper at the current value position. The
+    /// Open an extension wrapper at the current value position. The
     /// next value emitted - scalar, string, or container - becomes the
-    /// sum's payload and the parent slot points at the sum's tag byte
-    /// rather than the payload's own offset.
+    /// extension's payload and the parent slot points at the extension
+    /// tag byte rather than the payload's own offset.
     ///
-    /// Sums nest: calling `push_sum` again before the payload writes a
-    /// second sum header whose tag becomes the outer sum's payload, and
-    /// so on. The outermost sum's offset wins for the parent slot.
+    /// Extensions are opaque to the format: `ext_id` is meaningful only
+    /// to the consumer, and any structured per-extension information
+    /// must be carried inside the payload value (e.g. an object or
+    /// array). The writer assigns no semantics to `ext_id`.
+    ///
+    /// Extensions nest: calling `push_extension` again before the
+    /// payload writes a second extension header whose tag becomes the
+    /// outer extension's payload, and so on. The outermost extension's
+    /// offset wins for the parent slot.
     ///
     /// No-payload cases encode `Null` per spec; call [`push_null`](Self::push_null)
-    /// after `push_sum` to produce that shape.
+    /// after `push_extension` to produce that shape.
     ///
     /// Returns [`WriteError::MultipleRootValues`] at root level if a
     /// root value was already pushed, [`WriteError::KeyOutsideObject`]
     /// inside an object without a pending key, and
-    /// [`WriteError::SumWithoutPayload`] later if no payload follows
-    /// before the enclosing frame closes.
-    pub fn push_sum(&mut self, index: u64) -> Result<(), WriteError> {
+    /// [`WriteError::ExtensionWithoutPayload`] later if no payload
+    /// follows before the enclosing frame closes.
+    pub fn push_extension(&mut self, ext_id: u64) -> Result<(), WriteError> {
         self.check_ready()?;
         let depth = self.frames.len();
-        let nesting_at_depth: bool = self.pending_sums.last().is_some_and(|&(_, d)| d == depth);
+        let nesting_at_depth: bool = self.pending_exts.last().is_some_and(|&(_, d)| d == depth);
         match self.frames.last() {
             None => {
                 if self.root_offset.is_some() && !nesting_at_depth {
@@ -195,11 +201,11 @@ impl<S: Sink> RawWriter<S> {
             Some(Frame::Array(_)) => {}
         }
         let off = self.emit_scalar(|b| {
-            write_sum(b, index);
+            write_ext(b, ext_id);
             Ok(())
         })?;
         if !nesting_at_depth {
-            self.pending_sums.push((off, depth));
+            self.pending_exts.push((off, depth));
         }
         Ok(())
     }
@@ -283,9 +289,9 @@ impl<S: Sink> RawWriter<S> {
             self.poisoned = true;
             return Err(WriteError::Poisoned);
         }
-        if !self.pending_sums.is_empty() {
+        if !self.pending_exts.is_empty() {
             self.poisoned = true;
-            return Err(WriteError::SumWithoutPayload);
+            return Err(WriteError::ExtensionWithoutPayload);
         }
         let root = self.root_offset.ok_or(WriteError::EmptyDocument)?;
 
@@ -332,8 +338,8 @@ impl<S: Sink> RawWriter<S> {
 
     pub(crate) fn set_pending_key(&mut self, key: &str) -> Result<(), WriteError> {
         let depth = self.frames.len();
-        if self.pending_sums.last().is_some_and(|&(_, d)| d == depth) {
-            return Err(WriteError::SumWithoutPayload);
+        if self.pending_exts.last().is_some_and(|&(_, d)| d == depth) {
+            return Err(WriteError::ExtensionWithoutPayload);
         }
         let off = self.emit_scalar(|b| {
             write_string(b, key);
@@ -356,9 +362,9 @@ impl<S: Sink> RawWriter<S> {
             return Err(WriteError::Poisoned);
         }
         let depth = self.frames.len();
-        if self.pending_sums.last().is_some_and(|&(_, d)| d == depth) {
+        if self.pending_exts.last().is_some_and(|&(_, d)| d == depth) {
             self.poisoned = true;
-            return Err(WriteError::SumWithoutPayload);
+            return Err(WriteError::ExtensionWithoutPayload);
         }
         let Some(frame @ Frame::Array(_)) = self.frames.pop() else {
             unreachable!("top frame is not an array")
@@ -378,9 +384,9 @@ impl<S: Sink> RawWriter<S> {
             return Err(WriteError::Poisoned);
         }
         let depth = self.frames.len();
-        if self.pending_sums.last().is_some_and(|&(_, d)| d == depth) {
+        if self.pending_exts.last().is_some_and(|&(_, d)| d == depth) {
             self.poisoned = true;
-            return Err(WriteError::SumWithoutPayload);
+            return Err(WriteError::ExtensionWithoutPayload);
         }
         let Some(frame @ Frame::Object(_)) = self.frames.pop() else {
             unreachable!("top frame is not an object")
@@ -432,12 +438,13 @@ impl<S: Sink> RawWriter<S> {
     fn register_value(&mut self, off: u64) -> Result<(), WriteError> {
         let depth = self.frames.len();
 
-        // If a `pending_sum` is open at the current frame depth, its tag
-        // offset is used as the registered slot offset instead of `off`.
-        let slot_off = match self.pending_sums.last() {
-            Some(&(sum_off, d)) if d == depth => {
-                self.pending_sums.pop();
-                sum_off
+        // If a pending extension is open at the current frame depth, its
+        // tag offset is used as the registered slot offset instead of
+        // `off`.
+        let slot_off = match self.pending_exts.last() {
+            Some(&(ext_off, d)) if d == depth => {
+                self.pending_exts.pop();
+                ext_off
             }
             _ => off,
         };

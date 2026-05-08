@@ -23,6 +23,10 @@ path = "examples/monster.rs"
 name = "bench"
 path = "examples/bench.rs"
 
+[[example]]
+name = "extension"
+path = "examples/extension.rs"
+
 [dev-dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
 proptest = "1"
