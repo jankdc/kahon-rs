@@ -2,8 +2,8 @@
 
 use crate::error::WriteError;
 use crate::types::{
-    FALSE, FLOAT32, FLOAT64, INT16, INT32, INT64, INT8, NULL, STRING, SUM, TINY_NEG_INT,
-    TINY_STRING, TINY_SUM, TINY_UINT, TRUE, UINT16, UINT32, UINT64, UINT8,
+    EXT, FALSE, FLOAT32, FLOAT64, INT16, INT32, INT64, INT8, NULL, STRING, TINY_EXT, TINY_NEG_INT,
+    TINY_STRING, TINY_UINT, TRUE, UINT16, UINT32, UINT64, UINT8,
 };
 
 // Varuint continuation bit and payload mask
@@ -120,15 +120,15 @@ pub(crate) fn write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
-/// Write a sum header per §9. TinySum (0xC0..0xCF) for index ≤ 15,
-/// generic Sum (0xD0) + varuint otherwise. Caller supplies the payload
-/// value bytes immediately after.
-pub(crate) fn write_sum(buf: &mut Vec<u8>, index: u64) {
-    if index <= 15 {
-        buf.push(TINY_SUM + index as u8);
+/// Write an extension header per §9. TinyExt (0xC0..0xCF) for
+/// `ext_id` <= 15, generic Ext (0xD0) + varuint otherwise. Caller
+/// supplies the payload value bytes immediately after.
+pub(crate) fn write_ext(buf: &mut Vec<u8>, ext_id: u64) {
+    if ext_id <= 15 {
+        buf.push(TINY_EXT + ext_id as u8);
     } else {
-        buf.push(SUM);
-        write_varuint(buf, index);
+        buf.push(EXT);
+        write_varuint(buf, ext_id);
     }
 }
 
