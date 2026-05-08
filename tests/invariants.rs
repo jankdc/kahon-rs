@@ -1,4 +1,4 @@
-//! Spec §8.3 invariant: every internal B+tree node must reference m >= 2
+//! Spec §8 invariant 3: every internal B+tree node must reference m >= 2
 //! children. The walker (`common::walker`) traverses the emitted tree and
 //! fails the test on any m=1 internal node.
 
