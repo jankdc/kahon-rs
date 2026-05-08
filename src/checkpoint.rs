@@ -16,6 +16,7 @@ pub struct Checkpoint {
     root_offset: Option<u64>,
     frames: Vec<Frame>,
     poisoned: bool,
+    pending_sums: Vec<(u64, usize)>,
 }
 
 impl<S: RewindableSink> RawWriter<S> {
@@ -29,6 +30,7 @@ impl<S: RewindableSink> RawWriter<S> {
             root_offset: self.root_offset,
             frames: self.frames.clone(),
             poisoned: self.poisoned,
+            pending_sums: self.pending_sums.clone(),
         }
     }
 
@@ -48,6 +50,7 @@ impl<S: RewindableSink> RawWriter<S> {
         self.root_offset = cp.root_offset;
         self.frames = cp.frames;
         self.poisoned = cp.poisoned;
+        self.pending_sums = cp.pending_sums;
         Ok(())
     }
 }

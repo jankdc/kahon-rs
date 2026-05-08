@@ -81,7 +81,7 @@ fn snapshot_accessors_match_assembled_doc() {
     );
     assert_eq!(snap.root_offset(), stored_root);
 
-    // Byte at root_offset is an array tag (spec §5: 0x70..=0x77).
+    // Byte at root_offset is an array tag (spec §4 / §7.1: 0x70..=0x77).
     let tag = composed[snap.root_offset() as usize];
     assert!(
         (0x70..=0x77).contains(&tag),

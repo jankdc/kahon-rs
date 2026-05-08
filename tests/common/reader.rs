@@ -18,12 +18,12 @@ pub enum ReadError {
     SubTotalMismatch,
     OffsetOutOfBounds,
     OverlongVarint,
-    /// Container declared a wider offset slot than necessary (spec §7, §8.8).
+    /// Container declared a wider offset slot than necessary (spec §7, §8 invariant 8).
     NonMinimalWidth {
         declared: u8,
         needed: u8,
     },
-    /// A stored offset is >= the containing node's own offset (postorder violation, spec §9).
+    /// A stored offset is >= the containing node's own offset (postorder violation, spec §10).
     PostorderViolation {
         node_off: usize,
         child_off: usize,
@@ -63,7 +63,7 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, ReadError> {
 
 /// Look up `key` in the root object and return the offset of the matching
 /// value tag, or `None` if absent. Searches all runs of internal nodes per
-/// spec §8.5 (key ranges across siblings MAY overlap). Within a leaf, keys
+/// spec §8 invariant 6 (key ranges across siblings MAY overlap). Within a leaf, keys
 /// are sorted, so binary search applies.
 pub fn lookup_key(buf: &[u8], key: &[u8]) -> Result<Option<usize>, ReadError> {
     if buf.len() < 18 {
@@ -166,7 +166,7 @@ fn decode_inner(buf: &[u8], fanout_ceiling: Option<u64>) -> Result<Decoded, Read
     if &buf[0..4] != b"KAHN" {
         return Err(ReadError::BadMagic);
     }
-    if buf[4] != 0x01 {
+    if buf[4] != 0x02 {
         return Err(ReadError::BadVersion);
     }
     if buf[5] != 0x00 {

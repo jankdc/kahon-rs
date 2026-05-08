@@ -1,6 +1,6 @@
 //! Per-container builder state held during postorder body emission.
 //!
-//! Spec §13.2: "Per open JSON container, keep a frame with a level stack."
+//! Spec §14.2: "Per open JSON container, keep a frame with a level stack."
 //! A [`Frame`] is one such state - either an array under construction
 //! ([`ArrayBPlusBuilder`]) or an object whose pairs are being buffered into
 //! sorted runs and folded into a cross-run cascade ([`ObjectState`]).

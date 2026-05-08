@@ -26,6 +26,10 @@ pub enum WriteError {
     FrameMismatch,
     /// `RawWriter::push_key` was called outside an object frame.
     KeyOutsideObject,
+    /// A sum header was written but no payload value followed before
+    /// the enclosing frame closed (or `finish`/`snapshot_trailer` was
+    /// called).
+    SumWithoutPayload,
 }
 
 impl fmt::Display for WriteError {
@@ -42,6 +46,9 @@ impl fmt::Display for WriteError {
             }
             WriteError::KeyOutsideObject => {
                 write!(f, "raw writer key push outside an object frame")
+            }
+            WriteError::SumWithoutPayload => {
+                write!(f, "sum header written without a payload value following")
             }
         }
     }
