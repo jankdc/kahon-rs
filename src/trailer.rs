@@ -52,6 +52,13 @@ impl<S: RewindableSink> RawWriter<S> {
         if !self.frames.is_empty() && self.root_offset.is_some() {
             return Err(WriteError::MultipleRootValues);
         }
+        // Snapshot can't reconcile a half-written sum: closing the
+        // open frames would either drop the sum's payload-routing or
+        // produce a slot that points at a sum tag with no payload.
+        // Require the caller to land on a stable boundary first.
+        if !self.pending_sums.is_empty() {
+            return Err(WriteError::SumWithoutPayload);
+        }
 
         let prefix_len = self.pos;
         let mut tail: Vec<u8> = Vec::new();

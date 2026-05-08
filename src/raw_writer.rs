@@ -8,7 +8,9 @@
 use crate::align::write_padding;
 use crate::bplus::ArrayBPlusBuilder;
 use crate::config::{PageAlignment, WriterOptions};
-use crate::encode::{write_f64, write_false, write_integer, write_null, write_string, write_true};
+use crate::encode::{
+    write_f64, write_false, write_integer, write_null, write_string, write_sum, write_true,
+};
 use crate::error::WriteError;
 use crate::frame::{close_frame, Frame, ObjectState};
 use crate::sink::{Sink, WriteCtx};
@@ -28,6 +30,7 @@ pub struct RawWriter<S: Sink> {
     pub(crate) opts: WriterOptions,
     pub(crate) root_offset: Option<u64>,
     pub(crate) poisoned: bool,
+    pub(crate) pending_sums: Vec<(u64, usize)>,
 }
 
 impl<S: Sink> RawWriter<S> {
@@ -56,6 +59,7 @@ impl<S: Sink> RawWriter<S> {
             opts,
             root_offset: None,
             poisoned: false,
+            pending_sums: Vec::new(),
         };
         // If the header write fails, defer the error: poison now and surface
         // it on the first push/finish.
@@ -156,6 +160,50 @@ impl<S: Sink> RawWriter<S> {
         self.register_value(off)
     }
 
+    /// Open a sum wrapper at the current value position. The
+    /// next value emitted - scalar, string, or container - becomes the
+    /// sum's payload and the parent slot points at the sum's tag byte
+    /// rather than the payload's own offset.
+    ///
+    /// Sums nest: calling `push_sum` again before the payload writes a
+    /// second sum header whose tag becomes the outer sum's payload, and
+    /// so on. The outermost sum's offset wins for the parent slot.
+    ///
+    /// No-payload cases encode `Null` per spec; call [`push_null`](Self::push_null)
+    /// after `push_sum` to produce that shape.
+    ///
+    /// Returns [`WriteError::MultipleRootValues`] at root level if a
+    /// root value was already pushed, [`WriteError::KeyOutsideObject`]
+    /// inside an object without a pending key, and
+    /// [`WriteError::SumWithoutPayload`] later if no payload follows
+    /// before the enclosing frame closes.
+    pub fn push_sum(&mut self, index: u64) -> Result<(), WriteError> {
+        self.check_ready()?;
+        let depth = self.frames.len();
+        let nesting_at_depth: bool = self.pending_sums.last().is_some_and(|&(_, d)| d == depth);
+        match self.frames.last() {
+            None => {
+                if self.root_offset.is_some() && !nesting_at_depth {
+                    return Err(WriteError::MultipleRootValues);
+                }
+            }
+            Some(Frame::Object(o)) => {
+                if o.pending_key.is_none() && !nesting_at_depth {
+                    return Err(WriteError::KeyOutsideObject);
+                }
+            }
+            Some(Frame::Array(_)) => {}
+        }
+        let off = self.emit_scalar(|b| {
+            write_sum(b, index);
+            Ok(())
+        })?;
+        if !nesting_at_depth {
+            self.pending_sums.push((off, depth));
+        }
+        Ok(())
+    }
+
     /// Open an array frame. Pair with [`end_array`](Self::end_array).
     pub fn begin_array(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
@@ -235,6 +283,10 @@ impl<S: Sink> RawWriter<S> {
             self.poisoned = true;
             return Err(WriteError::Poisoned);
         }
+        if !self.pending_sums.is_empty() {
+            self.poisoned = true;
+            return Err(WriteError::SumWithoutPayload);
+        }
         let root = self.root_offset.ok_or(WriteError::EmptyDocument)?;
 
         // Pad so the 12-byte trailer ends on a page boundary.
@@ -279,6 +331,10 @@ impl<S: Sink> RawWriter<S> {
     }
 
     pub(crate) fn set_pending_key(&mut self, key: &str) -> Result<(), WriteError> {
+        let depth = self.frames.len();
+        if self.pending_sums.last().is_some_and(|&(_, d)| d == depth) {
+            return Err(WriteError::SumWithoutPayload);
+        }
         let off = self.emit_scalar(|b| {
             write_string(b, key);
             Ok(())
@@ -299,6 +355,11 @@ impl<S: Sink> RawWriter<S> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
         }
+        let depth = self.frames.len();
+        if self.pending_sums.last().is_some_and(|&(_, d)| d == depth) {
+            self.poisoned = true;
+            return Err(WriteError::SumWithoutPayload);
+        }
         let Some(frame @ Frame::Array(_)) = self.frames.pop() else {
             unreachable!("top frame is not an array")
         };
@@ -315,6 +376,11 @@ impl<S: Sink> RawWriter<S> {
     pub(crate) fn close_object_frame(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
+        }
+        let depth = self.frames.len();
+        if self.pending_sums.last().is_some_and(|&(_, d)| d == depth) {
+            self.poisoned = true;
+            return Err(WriteError::SumWithoutPayload);
         }
         let Some(frame @ Frame::Object(_)) = self.frames.pop() else {
             unreachable!("top frame is not an object")
@@ -364,6 +430,18 @@ impl<S: Sink> RawWriter<S> {
     /// Route a completed value's offset to the current context: the root slot,
     /// an open array frame, or an open object frame awaiting a key.
     fn register_value(&mut self, off: u64) -> Result<(), WriteError> {
+        let depth = self.frames.len();
+
+        // If a `pending_sum` is open at the current frame depth, its tag
+        // offset is used as the registered slot offset instead of `off`.
+        let slot_off = match self.pending_sums.last() {
+            Some(&(sum_off, d)) if d == depth => {
+                self.pending_sums.pop();
+                sum_off
+            }
+            _ => off,
+        };
+
         let run_buffer = self.opts.object_sort_window;
         let policy = &self.opts.policy;
         let mut ctx = WriteCtx {
@@ -377,11 +455,11 @@ impl<S: Sink> RawWriter<S> {
                 if self.root_offset.is_some() {
                     return Err(WriteError::MultipleRootValues);
                 }
-                self.root_offset = Some(off);
+                self.root_offset = Some(slot_off);
                 Ok(())
             }
-            Some(Frame::Array(a)) => a.push(off, policy, &mut ctx),
-            Some(Frame::Object(o)) => o.accept_value(off, run_buffer, policy, &mut ctx),
+            Some(Frame::Array(a)) => a.push(slot_off, policy, &mut ctx),
+            Some(Frame::Object(o)) => o.accept_value(slot_off, run_buffer, policy, &mut ctx),
         }
     }
 }
