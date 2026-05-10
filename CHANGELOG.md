@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/jankdc/kahon-rs/compare/v0.6.0...v0.6.1) - 2026-05-10
+
+### Fixed
+
+- emit extension header adjacent to payload type-code byte ([#16](https://github.com/jankdc/kahon-rs/pull/16))
+
 ## [0.6.0](https://github.com/jankdc/kahon-rs/compare/v0.5.0...v0.6.0) - 2026-05-08
 
 ### Added
