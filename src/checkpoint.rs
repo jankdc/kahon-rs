@@ -16,7 +16,7 @@ pub struct Checkpoint {
     root_offset: Option<u64>,
     frames: Vec<Frame>,
     poisoned: bool,
-    pending_exts: Vec<(u64, usize)>,
+    pending_exts: Vec<(Vec<u8>, usize)>,
 }
 
 impl<S: RewindableSink> RawWriter<S> {

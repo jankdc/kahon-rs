@@ -108,26 +108,39 @@ fn nested_exts_at_same_depth_collapse_to_outer_offset() {
 
 #[test]
 fn ext_wrapping_array_makes_root_the_ext() {
-    // push_extension at root, then [1] as the payload. Root is the ext
-    // tag; the array tag follows, with its own offsets unchanged.
+    // push_extension at root, then [1] as the payload. Per spec §9, the
+    // payload's type-code byte must be at ext_off + 1 + E. Because a
+    // container's root B+tree node is emitted last in postorder, the
+    // writer wraps the original root in a single-entry internal node and
+    // places the ext bytes immediately before that wrapper - so the byte
+    // at ext_off + 1 is the wrapper's tag.
     let buf = doc(|w| {
         w.push_extension(5)?;
         w.begin_array()?;
         w.push_i64(1)?;
         w.end_array()
     });
-    // C5 14 70 01 07  -- ext at 6, int at 7, array at 8.
-    assert_eq!(body(&buf), &[0xC5, 0x14, 0x70, 0x01, 0x07]);
-    assert_eq!(root_offset(&buf), 6);
+    // 14            -- int 1 at offset 6
+    // 70 01 06      -- original array leaf at offset 7, references int
+    // C5            -- ext id 5 at offset 10 (slot points here)
+    // 74 01 01 ..   -- single-entry wrapper internal at offset 11
+    assert_eq!(
+        body(&buf),
+        &[
+            0x14, 0x70, 0x01, 0x06, 0xC5, 0x74, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x07,
+        ]
+    );
+    assert_eq!(root_offset(&buf), 10);
 }
 
 #[test]
 fn nested_exts_across_frames_keep_separate_pending() {
     // push_extension at root, begin_array, push_extension (array slot's
-    // wrapper), push_int. Outer ext's payload is the array; inner ext's
-    // payload is the int. Array slot must point at inner ext (offset 8),
-    // not the int. Document root must point at outer ext (offset 6),
-    // not the array.
+    // wrapper), push_int. Outer ext wraps the array; inner ext wraps the
+    // int. The inner ext is the array's leaf entry (scalar payload, ext
+    // adjacent to int). The outer ext sits adjacent to a single-entry
+    // internal-node wrapper of the array root.
     let buf = doc(|w| {
         w.push_extension(0)?;
         w.begin_array()?;
@@ -135,7 +148,81 @@ fn nested_exts_across_frames_keep_separate_pending() {
         w.push_i64(2)?;
         w.end_array()
     });
-    assert_eq!(body(&buf), &[0xC0, 0xC1, 0x15, 0x70, 0x01, 0x07]);
+    // C1 15         -- inner ext at 6, int 2 at 7
+    // 70 01 06      -- array leaf at 8, child = inner ext
+    // C0            -- outer ext at 11 (slot points here)
+    // 74 ..         -- wrapper internal at 12
+    assert_eq!(
+        body(&buf),
+        &[
+            0xC1, 0x15, 0x70, 0x01, 0x06, 0xC0, 0x74, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x08,
+        ]
+    );
+    assert_eq!(root_offset(&buf), 11);
+}
+
+#[test]
+fn ext_wrapping_object_payload_lands_at_ext_off_plus_one() {
+    // Regression for the v0.6.0 bug: push_extension followed by an
+    // object payload used to record ext_off as the slot offset while
+    // emitting the ext tag in front of the object's first child rather
+    // than its root tag. Reading ext.payload() then handed back the key
+    // string instead of the object.
+    //
+    // With the fix, the ext bytes sit immediately before the wrapper
+    // internal-node tag, so the reader sees:
+    //   slot -> ext tag -> wrapper tag -> object root -> {a: hi}
+    let buf = doc(|w| {
+        w.push_extension(0)?;
+        w.begin_object()?;
+        w.push_key("a")?;
+        w.push_str("hi")?;
+        w.end_object()
+    });
+    // 60 61         -- key "a" at offset 6
+    // 61 68 69      -- value "hi" at offset 8
+    // 80 01 06 08   -- object leaf at offset 11 (key_off=6, val_off=8)
+    // C0            -- ext id 0 at offset 15 (slot points here)
+    // 84 ..         -- wrapper object internal at offset 16, child = leaf at 11
+    assert_eq!(
+        body(&buf),
+        &[
+            0x60, 0x61, 0x61, 0x68, 0x69, 0x80, 0x01, 0x06, 0x08, 0xC0, 0x84, 0x01, 0x01, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06, 0x0B,
+        ]
+    );
+    assert_eq!(root_offset(&buf), 15);
+    // Spec §9 invariant: byte at ext_off + 1 is the payload's type-code byte.
+    let ext_off = root_offset(&buf) as usize;
+    assert_eq!(buf[ext_off], 0xC0);
+    assert_eq!(buf[ext_off + 1] & 0xFC, 0x84); // OBJECT_INTERNAL_TAG (low 2 bits = width)
+}
+
+#[test]
+fn ext_wrapping_empty_object_places_ext_before_singleton_tag() {
+    // No fields = empty-object singleton. The ext bytes must still sit
+    // immediately before the EMPTY_OBJECT tag so a reader walking
+    // ext.payload() sees 0x34, not stray pre-ext bytes.
+    let buf = doc(|w| {
+        w.push_extension(7)?;
+        w.begin_object()?;
+        w.end_object()
+    });
+    // C7 34 -- ext at 6, EMPTY_OBJECT at 7.
+    assert_eq!(body(&buf), &[0xC7, 0x34]);
+    assert_eq!(root_offset(&buf), 6);
+}
+
+#[test]
+fn ext_wrapping_empty_array_places_ext_before_singleton_tag() {
+    let buf = doc(|w| {
+        w.push_extension(2)?;
+        w.begin_array()?;
+        w.end_array()
+    });
+    // C2 33 -- ext at 6, EMPTY_ARRAY at 7.
+    assert_eq!(body(&buf), &[0xC2, 0x33]);
     assert_eq!(root_offset(&buf), 6);
 }
 
@@ -191,4 +278,82 @@ fn second_root_after_completed_ext_errors() {
     w.push_i64(1).unwrap();
     let err = w.push_extension(0).unwrap_err();
     assert!(matches!(err, WriteError::MultipleRootValues), "{err:?}");
+}
+
+#[test]
+fn pending_ext_defers_bytes_written_and_shows_in_buffered_bytes() {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = RawWriter::new(&mut buf);
+    let pos_before = w.bytes_written();
+    let buf_before = w.buffered_bytes();
+
+    w.push_extension(0).unwrap();
+    assert_eq!(
+        w.bytes_written(),
+        pos_before,
+        "push_extension must not advance bytes_written; ext bytes are deferred"
+    );
+    assert!(
+        w.buffered_bytes() > buf_before,
+        "buffered_bytes must include the deferred ext header (was {}, now {})",
+        buf_before,
+        w.buffered_bytes()
+    );
+
+    // Stacking another ext at the same depth grows the deferred buffer
+    // further but still does not advance bytes_written.
+    let buf_one = w.buffered_bytes();
+    w.push_extension(1).unwrap();
+    assert_eq!(w.bytes_written(), pos_before);
+    assert!(w.buffered_bytes() > buf_one);
+
+    // Once the payload lands, bytes_written advances by ext bytes + scalar.
+    w.push_i64(0).unwrap();
+    let advanced = w.bytes_written() - pos_before;
+    // Two TinyExt bytes (one each for ids 0 and 1) plus one scalar tag.
+    assert_eq!(advanced, 3);
+
+    w.finish().unwrap();
+}
+
+#[test]
+fn pending_ext_for_object_payload_appears_in_buffered_bytes_across_frame() {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = RawWriter::new(&mut buf);
+
+    let before_ext = w.buffered_bytes();
+    w.push_extension(0).unwrap();
+    let with_ext_pending = w.buffered_bytes();
+    assert!(
+        with_ext_pending > before_ext,
+        "deferred ext header must appear in buffered_bytes ({} -> {})",
+        before_ext,
+        with_ext_pending
+    );
+
+    w.begin_object().unwrap();
+    let inside_open_object = w.buffered_bytes();
+    assert!(
+        inside_open_object >= with_ext_pending,
+        "pending ext at outer depth must persist while object is open"
+    );
+
+    w.push_key("a").unwrap();
+    w.push_str("hi").unwrap();
+
+    w.end_object().unwrap();
+    w.finish().unwrap();
+
+    let mut control_buf: Vec<u8> = Vec::new();
+    {
+        let mut c = RawWriter::new(&mut control_buf);
+        c.begin_object().unwrap();
+        c.push_key("a").unwrap();
+        c.push_str("hi").unwrap();
+        c.end_object().unwrap();
+        c.finish().unwrap();
+    }
+    // ext-wrapped doc must be larger by exactly the ext byte (1) + the
+    // single-entry object internal wrapper (14 bytes for w=0 here).
+    assert_eq!(buf.len(), control_buf.len() + 1 + 14);
 }
