@@ -12,7 +12,11 @@
 //! unaffected.
 //!
 
-use crate::bplus::{ArrayBPlusBuilder, ObjectBPlusBuilder, ObjectCascade, ObjectLeafItem};
+use crate::align::pad_for_node;
+use crate::bplus::{
+    emit_array_internal_bytes, emit_object_internal_bytes, ArrayBPlusBuilder, ObjEntry,
+    ObjectBPlusBuilder, ObjectCascade, ObjectLeafItem,
+};
 use crate::config::{BuildPolicy, WriterOptions};
 use crate::error::WriteError;
 use crate::sink::{Sink, WriteCtx};
@@ -101,13 +105,14 @@ impl ObjectState {
         self.runs_cascade.push(1, entry, policy, ctx)
     }
 
-    /// Flush the pending run (if any) and return the object root offset.
-    /// Writes the `EMPTY_OBJECT` singleton if nothing was ever pushed.
-    fn finalize<S: Sink>(
+    /// Flush any pending run and return the cascaded root entry, or `None`
+    /// if no key/value pair was ever pushed. The caller writes the
+    /// `EMPTY_OBJECT` singleton on `None`.
+    fn finalize_entry<S: Sink>(
         mut self,
         policy: &BuildPolicy,
         ctx: &mut WriteCtx<'_, S>,
-    ) -> Result<u64, WriteError> {
+    ) -> Result<Option<ObjEntry>, WriteError> {
         debug_assert!(
             self.pending_key.is_none(),
             "ObjectBuilder consumes pending_key before close; Some is unreachable"
@@ -115,18 +120,7 @@ impl ObjectState {
         if !self.current_run.is_empty() {
             self.flush_run(policy, ctx)?;
         }
-        // The cascade's `finalize` bubbles a lone entry up as a carry without
-        // emitting a wrapper - preserving the "single run is the root" fast
-        // path naturally.
-        match self.runs_cascade.finalize(policy, ctx)? {
-            None => {
-                let off = *ctx.pos;
-                ctx.sink.write_all(&[EMPTY_OBJECT])?;
-                *ctx.pos += 1;
-                Ok(off)
-            }
-            Some(root) => Ok(root.node_off),
-        }
+        self.runs_cascade.finalize(policy, ctx)
     }
 }
 
@@ -136,32 +130,92 @@ pub(crate) enum Frame {
     Object(ObjectState),
 }
 
-/// Drive a single frame's B+tree to its root, emitting any pending leaf and
-/// internal nodes through `ctx`. Returns the root's absolute offset (the
-/// type-code byte of the closed container).
+/// Drive a single frame's B+tree to its root, optionally emitting an
+/// extension header sequence immediately before the root's type-code byte
+/// (spec §9 requires the payload at `ext_off + 1 + E`).
+///
+/// When `prefix` is `Some`, the closed container's root is wrapped in a
+/// single-entry internal node so the extension header sits adjacent to a
+/// type-code byte we control. The returned offset points at the start of
+/// the prefix (the outermost extension tag); without a prefix, it points
+/// at the original root tag.
 ///
 /// For an empty array/object, emits the `EMPTY_ARRAY`/`EMPTY_OBJECT`
-/// singleton (spec §7.0) and returns its offset.
+/// singleton (spec §7.0) directly after any prefix.
 ///
 /// Used by both the live close path (`close_array_frame`/`close_object_frame`)
 /// and `snapshot_trailer`'s out-of-band close into a side buffer.
-pub(crate) fn close_frame<S: Sink>(
+pub(crate) fn close_frame_with_prefix<S: Sink>(
     frame: Frame,
     policy: &BuildPolicy,
     ctx: &mut WriteCtx<'_, S>,
+    prefix: Option<&[u8]>,
 ) -> Result<u64, WriteError> {
     match frame {
         Frame::Array(builder) => match builder.finalize(policy, ctx)? {
-            Some((_, off)) => Ok(off),
-            None => {
-                let off = *ctx.pos;
-                ctx.sink.write_all(&[EMPTY_ARRAY])?;
-                *ctx.pos += 1;
-                Ok(off)
-            }
+            Some((sub_total, root_off)) => match prefix {
+                None => Ok(root_off),
+                Some(p) => emit_ext_wrapped_array(ctx, p, sub_total, root_off, &policy.align),
+            },
+            None => emit_empty_singleton(ctx, prefix, EMPTY_ARRAY),
         },
-        Frame::Object(obj) => obj.finalize(policy, ctx),
+        Frame::Object(obj) => match obj.finalize_entry(policy, ctx)? {
+            Some(entry) => match prefix {
+                None => Ok(entry.node_off),
+                Some(p) => emit_ext_wrapped_object(ctx, p, entry, &policy.align),
+            },
+            None => emit_empty_singleton(ctx, prefix, EMPTY_OBJECT),
+        },
     }
+}
+
+fn emit_empty_singleton<S: Sink>(
+    ctx: &mut WriteCtx<'_, S>,
+    prefix: Option<&[u8]>,
+    tag: u8,
+) -> Result<u64, WriteError> {
+    let prefix = prefix.unwrap_or(&[]);
+    let slot_off = *ctx.pos;
+    if !prefix.is_empty() {
+        ctx.sink.write_all(prefix)?;
+        *ctx.pos += prefix.len() as u64;
+    }
+    ctx.sink.write_all(&[tag])?;
+    *ctx.pos += 1;
+    Ok(slot_off)
+}
+
+fn emit_ext_wrapped_array<S: Sink>(
+    ctx: &mut WriteCtx<'_, S>,
+    prefix: &[u8],
+    sub_total: u64,
+    root_off: u64,
+    align: &crate::config::PageAlignment,
+) -> Result<u64, WriteError> {
+    ctx.scratch.clear();
+    ctx.scratch.extend_from_slice(prefix);
+    emit_array_internal_bytes(ctx.scratch, &[(sub_total, root_off)]);
+    pad_for_node(ctx, ctx.scratch.len(), align)?;
+    let slot_off = *ctx.pos;
+    ctx.sink.write_all(ctx.scratch)?;
+    *ctx.pos += ctx.scratch.len() as u64;
+    Ok(slot_off)
+}
+
+fn emit_ext_wrapped_object<S: Sink>(
+    ctx: &mut WriteCtx<'_, S>,
+    prefix: &[u8],
+    entry: ObjEntry,
+    align: &crate::config::PageAlignment,
+) -> Result<u64, WriteError> {
+    ctx.scratch.clear();
+    ctx.scratch.extend_from_slice(prefix);
+    emit_object_internal_bytes(ctx.scratch, &[entry]);
+    pad_for_node(ctx, ctx.scratch.len(), align)?;
+    let slot_off = *ctx.pos;
+    ctx.sink.write_all(ctx.scratch)?;
+    *ctx.pos += ctx.scratch.len() as u64;
+    Ok(slot_off)
 }
 
 /// Register a completed value's offset into the given (parent) frame.

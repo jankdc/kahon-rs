@@ -12,7 +12,7 @@ use crate::encode::{
     write_ext, write_f64, write_false, write_integer, write_null, write_string, write_true,
 };
 use crate::error::WriteError;
-use crate::frame::{close_frame, Frame, ObjectState};
+use crate::frame::{close_frame_with_prefix, Frame, ObjectState};
 use crate::sink::{Sink, WriteCtx};
 use crate::types::{FLAGS, MAGIC, VERSION};
 
@@ -30,7 +30,7 @@ pub struct RawWriter<S: Sink> {
     pub(crate) opts: WriterOptions,
     pub(crate) root_offset: Option<u64>,
     pub(crate) poisoned: bool,
-    pub(crate) pending_exts: Vec<(u64, usize)>,
+    pub(crate) pending_exts: Vec<(Vec<u8>, usize)>,
 }
 
 impl<S: Sink> RawWriter<S> {
@@ -93,6 +93,10 @@ impl<S: Sink> RawWriter<S> {
                     t
                 }
             };
+        }
+        total += self.pending_exts.capacity() * std::mem::size_of::<(Vec<u8>, usize)>();
+        for (bytes, _) in &self.pending_exts {
+            total += bytes.capacity();
         }
         total
     }
@@ -186,7 +190,7 @@ impl<S: Sink> RawWriter<S> {
     pub fn push_extension(&mut self, ext_id: u64) -> Result<(), WriteError> {
         self.check_ready()?;
         let depth = self.frames.len();
-        let nesting_at_depth: bool = self.pending_exts.last().is_some_and(|&(_, d)| d == depth);
+        let nesting_at_depth: bool = self.pending_exts.last().is_some_and(|(_, d)| *d == depth);
         match self.frames.last() {
             None => {
                 if self.root_offset.is_some() && !nesting_at_depth {
@@ -200,12 +204,13 @@ impl<S: Sink> RawWriter<S> {
             }
             Some(Frame::Array(_)) => {}
         }
-        let off = self.emit_scalar(|b| {
-            write_ext(b, ext_id);
-            Ok(())
-        })?;
-        if !nesting_at_depth {
-            self.pending_exts.push((off, depth));
+        if nesting_at_depth {
+            let (bytes, _) = self.pending_exts.last_mut().unwrap();
+            write_ext(bytes, ext_id);
+        } else {
+            let mut bytes = Vec::with_capacity(1);
+            write_ext(&mut bytes, ext_id);
+            self.pending_exts.push((bytes, depth));
         }
         Ok(())
     }
@@ -338,7 +343,7 @@ impl<S: Sink> RawWriter<S> {
 
     pub(crate) fn set_pending_key(&mut self, key: &str) -> Result<(), WriteError> {
         let depth = self.frames.len();
-        if self.pending_exts.last().is_some_and(|&(_, d)| d == depth) {
+        if self.pending_exts.last().is_some_and(|(_, d)| *d == depth) {
             return Err(WriteError::ExtensionWithoutPayload);
         }
         let off = self.emit_scalar(|b| {
@@ -361,35 +366,64 @@ impl<S: Sink> RawWriter<S> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        let depth = self.frames.len();
-        if self.pending_exts.last().is_some_and(|&(_, d)| d == depth) {
+        let inner_depth = self.frames.len();
+        if self
+            .pending_exts
+            .last()
+            .is_some_and(|(_, d)| *d == inner_depth)
+        {
             self.poisoned = true;
             return Err(WriteError::ExtensionWithoutPayload);
         }
         let Some(frame @ Frame::Array(_)) = self.frames.pop() else {
             unreachable!("top frame is not an array")
         };
+        let slot_depth = self.frames.len();
+        let prefix = if self
+            .pending_exts
+            .last()
+            .is_some_and(|(_, d)| *d == slot_depth)
+        {
+            Some(self.pending_exts.pop().unwrap().0)
+        } else {
+            None
+        };
         let mut ctx = WriteCtx {
             sink: &mut self.sink,
             pos: &mut self.pos,
             scratch: &mut self.scratch,
             padding_written: &mut self.padding_written,
         };
-        let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
-        self.register_value(root_off)
+        let slot_off =
+            close_frame_with_prefix(frame, &self.opts.policy, &mut ctx, prefix.as_deref())?;
+        self.register_value(slot_off)
     }
 
     pub(crate) fn close_object_frame(&mut self) -> Result<(), WriteError> {
         if self.poisoned {
             return Err(WriteError::Poisoned);
         }
-        let depth = self.frames.len();
-        if self.pending_exts.last().is_some_and(|&(_, d)| d == depth) {
+        let inner_depth = self.frames.len();
+        if self
+            .pending_exts
+            .last()
+            .is_some_and(|(_, d)| *d == inner_depth)
+        {
             self.poisoned = true;
             return Err(WriteError::ExtensionWithoutPayload);
         }
         let Some(frame @ Frame::Object(_)) = self.frames.pop() else {
             unreachable!("top frame is not an object")
+        };
+        let slot_depth = self.frames.len();
+        let prefix = if self
+            .pending_exts
+            .last()
+            .is_some_and(|(_, d)| *d == slot_depth)
+        {
+            Some(self.pending_exts.pop().unwrap().0)
+        } else {
+            None
         };
         let mut ctx = WriteCtx {
             sink: &mut self.sink,
@@ -397,8 +431,9 @@ impl<S: Sink> RawWriter<S> {
             scratch: &mut self.scratch,
             padding_written: &mut self.padding_written,
         };
-        let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
-        self.register_value(root_off)
+        let slot_off =
+            close_frame_with_prefix(frame, &self.opts.policy, &mut ctx, prefix.as_deref())?;
+        self.register_value(slot_off)
     }
 
     // ------------------------------------------------------------------
@@ -420,35 +455,35 @@ impl<S: Sink> RawWriter<S> {
     }
 
     /// Serialize a scalar into `scratch` and emit it via callback.
-    /// Returns the offset where the value's tag byte was written.
+    /// Flushes any pending extension header bytes immediately before the
+    /// scalar so the payload tag lands at `ext_off + 1 + E` (spec §9).
+    /// Returns the slot offset (the outermost ext tag if one was flushed,
+    /// else the scalar's own tag byte).
     fn emit_scalar(
         &mut self,
         build: impl FnOnce(&mut Vec<u8>) -> Result<(), WriteError>,
     ) -> Result<u64, WriteError> {
+        let depth = self.frames.len();
+        let ext_off = if self.pending_exts.last().is_some_and(|(_, d)| *d == depth) {
+            let (ext_bytes, _) = self.pending_exts.pop().unwrap();
+            let off = self.pos;
+            self.sink.write_all(&ext_bytes)?;
+            self.pos += ext_bytes.len() as u64;
+            Some(off)
+        } else {
+            None
+        };
         self.scratch.clear();
         build(&mut self.scratch)?;
-        let off = self.pos;
+        let scalar_off = self.pos;
         self.sink.write_all(&self.scratch)?;
         self.pos += self.scratch.len() as u64;
-        Ok(off)
+        Ok(ext_off.unwrap_or(scalar_off))
     }
 
     /// Route a completed value's offset to the current context: the root slot,
     /// an open array frame, or an open object frame awaiting a key.
     fn register_value(&mut self, off: u64) -> Result<(), WriteError> {
-        let depth = self.frames.len();
-
-        // If a pending extension is open at the current frame depth, its
-        // tag offset is used as the registered slot offset instead of
-        // `off`.
-        let slot_off = match self.pending_exts.last() {
-            Some(&(ext_off, d)) if d == depth => {
-                self.pending_exts.pop();
-                ext_off
-            }
-            _ => off,
-        };
-
         let run_buffer = self.opts.object_sort_window;
         let policy = &self.opts.policy;
         let mut ctx = WriteCtx {
@@ -462,11 +497,11 @@ impl<S: Sink> RawWriter<S> {
                 if self.root_offset.is_some() {
                     return Err(WriteError::MultipleRootValues);
                 }
-                self.root_offset = Some(slot_off);
+                self.root_offset = Some(off);
                 Ok(())
             }
-            Some(Frame::Array(a)) => a.push(slot_off, policy, &mut ctx),
-            Some(Frame::Object(o)) => o.accept_value(slot_off, run_buffer, policy, &mut ctx),
+            Some(Frame::Array(a)) => a.push(off, policy, &mut ctx),
+            Some(Frame::Object(o)) => o.accept_value(off, run_buffer, policy, &mut ctx),
         }
     }
 }

@@ -163,11 +163,7 @@ fn emit_object_leaf<S: Sink>(
     Ok(node_off)
 }
 
-fn emit_array_internal<S: Sink>(
-    ctx: &mut WriteCtx<'_, S>,
-    pairs: &[(u64, u64)],
-    align: &PageAlignment,
-) -> Result<u64, WriteError> {
+pub(crate) fn emit_array_internal_bytes(out: &mut Vec<u8>, pairs: &[(u64, u64)]) {
     let mut max_off = 0u64;
     let mut total = 0u64;
     for &(st, off) in pairs {
@@ -177,14 +173,37 @@ fn emit_array_internal<S: Sink>(
         }
     }
     let (w, width) = smallest_width(max_off);
-    ctx.scratch.clear();
-    ctx.scratch.push(ARRAY_INTERNAL_TAG | w);
-    write_varuint(ctx.scratch, total);
-    write_varuint(ctx.scratch, pairs.len() as u64);
+    out.push(ARRAY_INTERNAL_TAG | w);
+    write_varuint(out, total);
+    write_varuint(out, pairs.len() as u64);
     for &(st, off) in pairs {
-        ctx.scratch.extend_from_slice(&st.to_le_bytes());
-        write_uintw(ctx.scratch, off, width);
+        out.extend_from_slice(&st.to_le_bytes());
+        write_uintw(out, off, width);
     }
+}
+
+pub(crate) fn emit_object_internal_bytes(out: &mut Vec<u8>, entries: &[ObjEntry]) {
+    let max_off = entries.iter().map(ObjEntry::max_offset).max().unwrap_or(0);
+    let (w, width) = smallest_width(max_off);
+    let total: u64 = entries.iter().map(|e| e.sub_total).sum();
+    out.push(OBJECT_INTERNAL_TAG | w);
+    write_varuint(out, total);
+    write_varuint(out, entries.len() as u64);
+    for e in entries {
+        out.extend_from_slice(&e.sub_total.to_le_bytes());
+        write_uintw(out, e.key_lo_off, width);
+        write_uintw(out, e.key_hi_off, width);
+        write_uintw(out, e.node_off, width);
+    }
+}
+
+fn emit_array_internal<S: Sink>(
+    ctx: &mut WriteCtx<'_, S>,
+    pairs: &[(u64, u64)],
+    align: &PageAlignment,
+) -> Result<u64, WriteError> {
+    ctx.scratch.clear();
+    emit_array_internal_bytes(ctx.scratch, pairs);
     pad_for_node(ctx, ctx.scratch.len(), align)?;
     let node_off = *ctx.pos;
     ctx.sink.write_all(ctx.scratch)?;
@@ -197,19 +216,8 @@ fn emit_object_internal<S: Sink>(
     entries: &[ObjEntry],
     align: &PageAlignment,
 ) -> Result<u64, WriteError> {
-    let max_off = entries.iter().map(ObjEntry::max_offset).max().unwrap_or(0);
-    let (w, width) = smallest_width(max_off);
-    let total: u64 = entries.iter().map(|e| e.sub_total).sum();
     ctx.scratch.clear();
-    ctx.scratch.push(OBJECT_INTERNAL_TAG | w);
-    write_varuint(ctx.scratch, total);
-    write_varuint(ctx.scratch, entries.len() as u64);
-    for e in entries {
-        ctx.scratch.extend_from_slice(&e.sub_total.to_le_bytes());
-        write_uintw(ctx.scratch, e.key_lo_off, width);
-        write_uintw(ctx.scratch, e.key_hi_off, width);
-        write_uintw(ctx.scratch, e.node_off, width);
-    }
+    emit_object_internal_bytes(ctx.scratch, entries);
     pad_for_node(ctx, ctx.scratch.len(), align)?;
     let node_off = *ctx.pos;
     ctx.sink.write_all(ctx.scratch)?;

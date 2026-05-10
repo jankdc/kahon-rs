@@ -1,7 +1,7 @@
 use crate::align::write_padding;
 use crate::config::PageAlignment;
 use crate::error::WriteError;
-use crate::frame::{close_frame, register_into_frame, Frame};
+use crate::frame::{close_frame_with_prefix, register_into_frame, Frame};
 use crate::raw_writer::RawWriter;
 use crate::sink::{RewindableSink, WriteCtx};
 use crate::types::MAGIC;
@@ -88,7 +88,7 @@ impl<S: RewindableSink> RawWriter<S> {
                 scratch: &mut scratch,
                 padding_written: &mut tail_padding,
             };
-            let root_off = close_frame(frame, &self.opts.policy, &mut ctx)?;
+            let root_off = close_frame_with_prefix(frame, &self.opts.policy, &mut ctx, None)?;
             if let Some(parent) = frames.last_mut() {
                 register_into_frame(parent, root_off, &self.opts, &mut ctx)?;
             } else {
